@@ -1,0 +1,388 @@
+"""Orchestration flow with DI-friendly seams for tests."""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional
+from uuid import uuid4
+
+from agent_discord.contracts import (
+    ContextSnapshot,
+    DispatchRequest,
+    EventKind,
+    ProgressSummary,
+    RunReceipt,
+    TaskIntake,
+    TaskStatus,
+    UsageReceipt,
+)
+from agent_discord.discord.facade import DiscordFacade
+from agent_discord.orchestration.receipts import render_receipt
+from agent_discord.persistence.research import ResearchMemoryStore
+from agent_discord.persistence.sqlite import SQLiteStore
+from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
+from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
+
+
+class AgentOrchestrator:
+    """intake → context snapshot → pinned dispatch → events → Discord → receipt."""
+
+    def __init__(
+        self,
+        *,
+        store: SQLiteStore,
+        backend: Any,
+        discord: Optional[DiscordFacade] = None,
+        model: str = DEFAULT_MODEL_PIN.canonical,
+        post_progress_to_discord: bool = True,
+        research: Optional[ResearchMemoryStore] = None,
+    ) -> None:
+        self.store = store
+        self.backend = backend
+        self.discord = discord
+        self.model = model
+        self.post_progress_to_discord = post_progress_to_discord
+        # Optional research seam — None keeps normal tasks free of research metadata.
+        self.research = research
+        self._run_status: dict[str, TaskStatus] = {}
+
+    def run_task(self, intake: TaskIntake) -> RunReceipt:
+        pin = self.backend.resolve_model(self.model)
+        if intake.message_id:
+            claimed = self.store.claim_inbound_message(
+                intake.message_id, intake.channel_id
+            )
+            if not claimed:
+                return self._duplicate_receipt(intake.message_id)
+
+        task_id = uuid4().hex
+        run_id = uuid4().hex
+
+        self.store.upsert_binding(
+            workspace_id=intake.workspace_id,
+            channel_id=intake.channel_id,
+            guild_id=intake.guild_id,
+            metadata={"thread_id": intake.thread_id},
+        )
+        self.store.create_task(
+            task_id=task_id,
+            workspace_id=intake.workspace_id,
+            channel_id=intake.channel_id,
+            intake_text=intake.text,
+            thread_id=intake.thread_id,
+            requester_id=intake.requester_id,
+            metadata=dict(intake.metadata),
+        )
+        self.store.create_run(
+            run_id=run_id,
+            task_id=task_id,
+            model=pin.canonical,
+            adapter_name=pin.adapter_name,
+            status=TaskStatus.RUNNING,
+        )
+        self._run_status[run_id] = TaskStatus.RUNNING
+
+        if intake.message_id:
+            self.store.bind_inbound_message(
+                intake.message_id,
+                task_id=task_id,
+                run_id=run_id,
+                channel_id=intake.channel_id,
+            )
+            if self.discord is not None:
+                try:
+                    self.discord.observe_message_id(intake.message_id)
+                except Exception:
+                    # Process-local facade dedupe is best-effort; SQLite is authoritative.
+                    pass
+
+        self._event(
+            task_id,
+            run_id,
+            EventKind.INTAKE,
+            "task intake accepted",
+            {"text": intake.text, "channel_id": intake.channel_id},
+            source="orchestrator",
+        )
+
+        memories = list(
+            self.store.recall(
+                workspace_id=intake.workspace_id,
+                channel_id=intake.channel_id,
+                query=intake.text,
+                limit=8,
+            )
+        )
+        binding = self.store.get_binding(intake.workspace_id, intake.channel_id) or {}
+        research_context = self._optional_research_context(intake)
+        provenance: dict[str, Any] = {
+            "source": "sqlite",
+            "memory_count": len(memories),
+        }
+        if research_context:
+            provenance["research"] = research_context
+        snapshot = ContextSnapshot(
+            task_id=task_id,
+            memories=memories,
+            bindings={
+                "workspace_id": intake.workspace_id,
+                "channel_id": intake.channel_id,
+                "guild_id": intake.guild_id,
+                "binding": binding,
+            },
+            provenance=provenance,
+        )
+        self._event(
+            task_id,
+            run_id,
+            EventKind.CONTEXT_SNAPSHOT,
+            f"context snapshot ({len(memories)} memories)",
+            {
+                "memory_ids": [m.get("memory_id") for m in memories],
+                "provenance": dict(snapshot.provenance),
+            },
+            source="orchestrator",
+        )
+
+        progress_items: list[ProgressSummary] = []
+        request = DispatchRequest(
+            task_id=task_id,
+            run_id=run_id,
+            prompt=intake.text,
+            model=pin.canonical,
+            context=snapshot,
+            metadata={"channel_id": intake.channel_id},
+        )
+        result = self.backend.dispatch(request)
+
+        for event in result.events:
+            safe_details = strip_forbidden_keys(dict(event.summary.details))
+            if not isinstance(safe_details, dict):
+                safe_details = {}
+            safe_payload = strip_forbidden_keys(dict(event.payload))
+            if not isinstance(safe_payload, dict):
+                safe_payload = {}
+            summary = ProgressSummary(
+                stage=event.summary.stage,
+                message=redact_text_markers(event.summary.message),
+                percent=event.summary.percent,
+                details=safe_details,
+            )
+            progress_items.append(summary)
+            self._event(
+                task_id,
+                run_id,
+                event.kind,
+                summary.message,
+                {
+                    "stage": summary.stage,
+                    "percent": summary.percent,
+                    "details": dict(summary.details),
+                    **safe_payload,
+                },
+                source="backend",
+            )
+            if (
+                self.post_progress_to_discord
+                and self.discord is not None
+                and event.kind == EventKind.PROGRESS
+            ):
+                self.discord.send_message(
+                    intake.channel_id,
+                    f"[{summary.stage}] {summary.message}",
+                    thread_id=intake.thread_id,
+                )
+
+        for art in result.artifacts:
+            self.store.add_artifact(
+                artifact_id=art.artifact_id,
+                task_id=task_id,
+                run_id=run_id,
+                kind=art.kind,
+                path=art.path,
+                provenance=strip_forbidden_keys(dict(art.provenance))
+                if isinstance(art.provenance, Mapping)
+                else {},
+            )
+
+        usage_map = None
+        if result.usage is not None:
+            usage_map = {
+                "model": result.usage.model,
+                "adapter_name": result.usage.adapter_name,
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+                "metadata": strip_forbidden_keys(dict(result.usage.metadata)),
+            }
+
+        safe_final_summary = redact_text_markers(result.final_summary)
+        safe_error = redact_text_markers(result.error) if result.error else None
+        self.store.update_run(
+            run_id,
+            status=result.status,
+            summary=safe_final_summary,
+            error=safe_error,
+            usage=usage_map,
+        )
+        self._run_status[run_id] = result.status
+
+        self.store.remember(
+            workspace_id=intake.workspace_id,
+            channel_id=intake.channel_id,
+            content=f"task:{intake.text[:240]} → {safe_final_summary[:240]}",
+            source="orchestrator",
+            provenance={"task_id": task_id, "run_id": run_id, "status": result.status.value},
+        )
+
+        receipt = RunReceipt(
+            task_id=task_id,
+            run_id=run_id,
+            status=result.status,
+            summary=safe_final_summary,
+            progress=tuple(progress_items),
+            artifacts=tuple(result.artifacts),
+            usage=result.usage,
+            error=safe_error,
+        )
+        rendered = render_receipt(receipt)
+        self._event(
+            task_id,
+            run_id,
+            EventKind.RECEIPT,
+            "final receipt",
+            {"rendered": rendered, "status": result.status.value},
+            source="orchestrator",
+        )
+
+        if self.post_progress_to_discord and self.discord is not None:
+            self.discord.send_message(
+                intake.channel_id,
+                rendered,
+                thread_id=intake.thread_id,
+            )
+
+        return receipt
+
+    def _duplicate_receipt(self, message_id: str) -> RunReceipt:
+        """Return prior receipt or an explicit ignored-duplicate result (no re-dispatch)."""
+        prior = self.store.get_inbound_message(message_id) or {}
+        run_id = prior.get("run_id") or ""
+        task_id = prior.get("task_id") or ""
+        if run_id:
+            run = self.store.get_run(str(run_id))
+            if run:
+                usage = None
+                if run.get("usage_json"):
+                    import json
+
+                    try:
+                        raw = json.loads(run["usage_json"])
+                    except json.JSONDecodeError:
+                        raw = None
+                    if isinstance(raw, dict):
+                        usage = UsageReceipt(
+                            model=str(raw.get("model") or run.get("model") or ""),
+                            adapter_name=str(
+                                raw.get("adapter_name") or run.get("adapter_name") or ""
+                            ),
+                            input_tokens=raw.get("input_tokens"),
+                            output_tokens=raw.get("output_tokens"),
+                            metadata=strip_forbidden_keys(dict(raw.get("metadata") or {})),
+                        )
+                status = TaskStatus(run["status"])
+                self._run_status[str(run_id)] = status
+                return RunReceipt(
+                    task_id=str(run["task_id"]),
+                    run_id=str(run_id),
+                    status=status,
+                    summary=str(
+                        run.get("summary")
+                        or f"reused prior receipt for duplicate message_id={message_id}"
+                    ),
+                    usage=usage,
+                    error=run.get("error"),
+                )
+        return RunReceipt(
+            task_id=str(task_id or "duplicate"),
+            run_id=str(run_id or "duplicate"),
+            status=TaskStatus.COMPLETED,
+            summary=f"ignored duplicate inbound message_id={message_id}",
+            error=None,
+        )
+
+    def _optional_research_context(self, intake: TaskIntake) -> Optional[dict[str, Any]]:
+        """Attach research claims/negatives only when a research store is configured."""
+        if self.research is None:
+            return None
+        claims = self.research.list_claims(workspace_id=intake.workspace_id, limit=8)
+        negatives = self.research.list_negative_findings(
+            workspace_id=intake.workspace_id, limit=8
+        )
+        if not claims and not negatives:
+            return None
+        return {
+            "claim_count": len(claims),
+            "negative_count": len(negatives),
+            "claims": [
+                {
+                    "fingerprint": c.fingerprint,
+                    "status": c.status.value,
+                    "scope": c.scope,
+                    "claim_text": c.claim_text[:400],
+                }
+                for c in claims
+            ],
+            "negative_findings": [
+                {
+                    "fingerprint": n.fingerprint,
+                    "scope": n.scope,
+                    "claim_text": n.claim_text[:400],
+                }
+                for n in negatives
+            ],
+        }
+
+    def cancel(self, run_id: str) -> bool:
+        ok = bool(self.backend.cancel(run_id))
+        if ok:
+            self._run_status[run_id] = TaskStatus.CANCELLED
+            run = self.store.get_run(run_id)
+            if run:
+                self.store.update_run(run_id, status=TaskStatus.CANCELLED, error="cancelled")
+                self._event(
+                    run["task_id"],
+                    run_id,
+                    EventKind.CANCEL_REQUESTED,
+                    "cancel requested",
+                    {},
+                    source="orchestrator",
+                )
+        return ok
+
+    def status(self, run_id: str) -> TaskStatus:
+        if run_id in self._run_status:
+            return self._run_status[run_id]
+        backend_status = self.backend.status(run_id)
+        run = self.store.get_run(run_id)
+        if run:
+            return TaskStatus(run["status"])
+        return backend_status
+
+    def _event(
+        self,
+        task_id: str,
+        run_id: str,
+        kind: EventKind,
+        summary: str,
+        payload: dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        self.store.append_event(
+            task_id=task_id,
+            run_id=run_id,
+            kind=kind,
+            summary=redact_text_markers(summary),
+            payload=strip_forbidden_keys(payload),
+            source=source,
+            provenance={"component": "AgentOrchestrator"},
+        )
