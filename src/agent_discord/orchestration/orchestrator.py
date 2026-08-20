@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping, Optional
 from uuid import uuid4
 
 from agent_discord.contracts import (
+    ArtifactRef,
     ContextSnapshot,
     DispatchRequest,
     EventKind,
@@ -16,7 +18,8 @@ from agent_discord.contracts import (
     UsageReceipt,
 )
 from agent_discord.discord.facade import DiscordFacade
-from agent_discord.orchestration.receipts import render_receipt
+from agent_discord.discord.object_store import DEFAULT_MAX_OBJECT_BYTES, DiscordObjectStore
+from agent_discord.orchestration.cards import render_progress_card, render_receipt_card
 from agent_discord.persistence.research import ResearchMemoryStore
 from agent_discord.persistence.sqlite import SQLiteStore
 from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
@@ -35,6 +38,8 @@ class AgentOrchestrator:
         model: str = DEFAULT_MODEL_PIN.canonical,
         post_progress_to_discord: bool = True,
         research: Optional[ResearchMemoryStore] = None,
+        max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        workspace: Optional[Path] = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -43,6 +48,8 @@ class AgentOrchestrator:
         self.post_progress_to_discord = post_progress_to_discord
         # Optional research seam — None keeps normal tasks free of research metadata.
         self.research = research
+        self.max_object_bytes = max_object_bytes
+        self.workspace = Path(workspace) if workspace is not None else None
         self._run_status: dict[str, TaskStatus] = {}
 
     def run_task(self, intake: TaskIntake) -> RunReceipt:
@@ -144,6 +151,7 @@ class AgentOrchestrator:
         )
 
         progress_items: list[ProgressSummary] = []
+        progress_message_id: Optional[str] = None
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
@@ -186,23 +194,23 @@ class AgentOrchestrator:
                 and self.discord is not None
                 and event.kind == EventKind.PROGRESS
             ):
-                self.discord.send_message(
+                card = render_progress_card(
+                    stage=summary.stage,
+                    message=summary.message,
+                    percent=summary.percent,
+                    run_id=run_id,
+                )
+                progress_message_id = self._post_or_edit_progress(
                     intake.channel_id,
-                    f"[{summary.stage}] {summary.message}",
+                    card,
                     thread_id=intake.thread_id,
+                    message_id=progress_message_id,
                 )
 
+        receipt_artifacts: list[ArtifactRef] = []
         for art in result.artifacts:
-            self.store.add_artifact(
-                artifact_id=art.artifact_id,
-                task_id=task_id,
-                run_id=run_id,
-                kind=art.kind,
-                path=art.path,
-                provenance=strip_forbidden_keys(dict(art.provenance))
-                if isinstance(art.provenance, Mapping)
-                else {},
-            )
+            persisted = self._persist_artifact(art, intake=intake, task_id=task_id, run_id=run_id)
+            receipt_artifacts.append(persisted)
 
         usage_map = None
         if result.usage is not None:
@@ -239,11 +247,11 @@ class AgentOrchestrator:
             status=result.status,
             summary=safe_final_summary,
             progress=tuple(progress_items),
-            artifacts=tuple(result.artifacts),
+            artifacts=tuple(receipt_artifacts),
             usage=result.usage,
             error=safe_error,
         )
-        rendered = render_receipt(receipt)
+        rendered = render_receipt_card(receipt)
         self._event(
             task_id,
             run_id,
@@ -309,6 +317,86 @@ class AgentOrchestrator:
             error=None,
         )
 
+    def _persist_artifact(
+        self,
+        art: ArtifactRef,
+        *,
+        intake: TaskIntake,
+        task_id: str,
+        run_id: str,
+    ) -> ArtifactRef:
+        provenance = (
+            strip_forbidden_keys(dict(art.provenance))
+            if isinstance(art.provenance, Mapping)
+            else {}
+        )
+        if not isinstance(provenance, dict):
+            provenance = {}
+        persisted = art
+        if art.message_id and art.attachment_id:
+            persisted = art
+        elif self.discord is not None and art.path and Path(art.path).is_file():
+            try:
+                data = Path(art.path).read_bytes()
+                store = DiscordObjectStore(
+                    self.discord,
+                    max_bytes=self.max_object_bytes,
+                    workspace=self.workspace,
+                )
+                ref = store.put_or_overflow(
+                    data,
+                    channel_id=intake.channel_id,
+                    filename=art.filename or Path(art.path).name,
+                    kind=art.kind,
+                    thread_id=intake.thread_id,
+                    guild_id=intake.guild_id,
+                    author_id=intake.requester_id,
+                )
+                if intake.guild_id:
+                    provenance = {**provenance, "guild_id": intake.guild_id}
+                if intake.thread_id:
+                    provenance = {**provenance, "thread_id": intake.thread_id}
+                persisted = ArtifactRef(
+                    artifact_id=art.artifact_id,
+                    kind=ref.kind,
+                    path=art.path,
+                    provenance=provenance,
+                    channel_id=ref.channel_id,
+                    message_id=ref.message_id,
+                    attachment_id=ref.attachment_id,
+                    sha256=ref.sha256,
+                    size=ref.size,
+                    filename=ref.filename,
+                )
+            except Exception as exc:
+                provenance = {**provenance, "object_store_error": str(exc)}
+                persisted = ArtifactRef(
+                    artifact_id=art.artifact_id,
+                    kind=art.kind,
+                    path=art.path,
+                    provenance=provenance,
+                    filename=art.filename,
+                    size=art.size,
+                    sha256=art.sha256,
+                )
+        self.store.add_artifact(
+            artifact_id=persisted.artifact_id,
+            task_id=task_id,
+            run_id=run_id,
+            kind=persisted.kind,
+            path=persisted.path or "",
+            provenance=persisted.provenance
+            if isinstance(persisted.provenance, Mapping)
+            else provenance,
+            channel_id=persisted.channel_id,
+            message_id=persisted.message_id,
+            attachment_id=persisted.attachment_id,
+            filename=persisted.filename,
+            sha256=persisted.sha256,
+            size=persisted.size,
+        )
+        return persisted
+
     def _optional_research_context(self, intake: TaskIntake) -> Optional[dict[str, Any]]:
         """Attach research claims/negatives only when a research store is configured."""
         if self.research is None:
@@ -340,6 +428,27 @@ class AgentOrchestrator:
                 for n in negatives
             ],
         }
+
+    def _post_or_edit_progress(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        thread_id: Optional[str],
+        message_id: Optional[str],
+    ) -> Optional[str]:
+        if self.discord is None:
+            return message_id
+        if message_id:
+            try:
+                edited = self.discord.edit_message(channel_id, message_id, content)
+                return edited.message_id or message_id
+            except Exception:
+                pass
+        posted = self.discord.send_message(channel_id, content, thread_id=thread_id)
+        if posted:
+            return posted[-1].message_id or message_id
+        return message_id
 
     def cancel(self, run_id: str) -> bool:
         ok = bool(self.backend.cancel(run_id))

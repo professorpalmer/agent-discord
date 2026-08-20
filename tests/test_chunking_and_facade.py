@@ -54,6 +54,16 @@ def test_chunk_empty():
     assert chunk_message("") == [""]
 
 
+def test_facade_repeats_card_prefix_on_every_chunk():
+    fake = FakeDiscordMCPProvider()
+    facade = DiscordFacade(fake, bot_token_fingerprint="abc", owner_id="o1")
+    body = "progress line\n" * 40
+    posted = facade.send_message("ch", f"**Card** PROGRESS\n{body}", chunk_limit=40)
+    assert len(posted) > 1
+    assert posted[0].content.startswith("**Card** PROGRESS")
+    assert all(m.content.startswith("**Card**") for m in posted)
+
+
 def test_facade_chunks_and_dedupes():
     fake = FakeDiscordMCPProvider()
     facade = DiscordFacade(fake, bot_token_fingerprint="abc", owner_id="o1")

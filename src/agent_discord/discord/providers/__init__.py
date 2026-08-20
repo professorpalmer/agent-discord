@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from agent_discord.config import AppConfig
 from agent_discord.discord.errors import ProviderSelectionError
 from agent_discord.discord.providers.base import HttpJsonMCPClient, StdioMCPClient
 from agent_discord.discord.providers.braindao import BrainDAODiscordProvider
 from agent_discord.discord.providers.fake import FakeDiscordMCPProvider
+from agent_discord.discord.providers.rest import RestDiscordProvider
 from agent_discord.discord.providers.saseq import SaseQDiscordProvider
 
 
-def select_provider(config: AppConfig, *, client: Any | None = None):
+def select_provider(
+    config: AppConfig,
+    *,
+    client: Any | None = None,
+    bot_token: Optional[str] = None,
+):
     """Build a provider adapter from config. Inject `client` in tests."""
+    token = config.discord_bot_token if bot_token is None else bot_token
     name = config.discord_mcp_provider
+    if name == "rest":
+        return RestDiscordProvider(bot_token=token)
     if name == "saseq":
         if client is None:
             client = _default_client(
@@ -23,7 +32,7 @@ def select_provider(config: AppConfig, *, client: Any | None = None):
                 stdio_command=config.discord_mcp_stdio_command,
                 provider="saseq",
             )
-        return SaseQDiscordProvider(client=client)
+        return SaseQDiscordProvider(client=client, bot_token=token)
     if name == "braindao":
         if client is None:
             client = _default_client(
@@ -32,7 +41,7 @@ def select_provider(config: AppConfig, *, client: Any | None = None):
                 stdio_command=config.discord_mcp_stdio_command,
                 provider="braindao",
             )
-        return BrainDAODiscordProvider(client=client)
+        return BrainDAODiscordProvider(client=client, bot_token=token)
     raise ProviderSelectionError(f"unknown provider {name!r}")
 
 
@@ -58,6 +67,7 @@ def _default_client(
 
 __all__ = [
     "FakeDiscordMCPProvider",
+    "RestDiscordProvider",
     "SaseQDiscordProvider",
     "BrainDAODiscordProvider",
     "select_provider",

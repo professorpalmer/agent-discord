@@ -6,11 +6,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent_discord import PRODUCT_NAME
 from agent_discord.config import AppConfig, load_config
 from agent_discord.persistence.sqlite import SQLiteStore
 
 
 BOOTSTRAP_MARKER = "bootstrap.json"
+MINIMAL_ENV = """# Discord OS — fill these in. Never commit real tokens.
+DISCORD_BOT_TOKEN=
+DISCORD_APPLICATION_ID=
+OPENROUTER_API_KEY=
+"""
 
 
 def bootstrap_workspace(
@@ -24,13 +30,16 @@ def bootstrap_workspace(
     config.workspace.mkdir(parents=True, exist_ok=True)
     (config.workspace / "artifacts").mkdir(parents=True, exist_ok=True)
     (config.workspace / "logs").mkdir(parents=True, exist_ok=True)
+    (config.workspace / "keys").mkdir(parents=True, exist_ok=True)
+    (config.workspace / "stash").mkdir(parents=True, exist_ok=True)
 
     store = SQLiteStore(config.database_path)
     store.initialize()
     store.close()
 
     marker = {
-        "version": "0.1.0",
+        "product": PRODUCT_NAME,
+        "version": "0.3.0",
         "workspace": str(config.workspace),
         "database": str(config.database_path),
         "discord_mcp_provider": config.discord_mcp_provider,
@@ -45,8 +54,11 @@ def bootstrap_workspace(
     env_example = Path.cwd() / ".env.example"
     env_target = Path.cwd() / ".env"
     created_env = False
-    if env_example.is_file() and not env_target.exists():
-        env_target.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+    if not env_target.exists():
+        if env_example.is_file():
+            env_target.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            env_target.write_text(MINIMAL_ENV, encoding="utf-8")
         created_env = True
 
     return {

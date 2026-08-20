@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_discord.contracts import RunReceipt, TaskStatus
+from agent_discord.contracts import RunReceipt, TaskStatus, discord_jump_url
 from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
 
 
@@ -40,7 +40,18 @@ def render_receipt(receipt: RunReceipt, *, max_progress: int = 5) -> str:
         for art in receipt.artifacts:
             safe_prov = strip_forbidden_keys(dict(art.provenance))
             _ = safe_prov  # provenance is never rendered into Discord text
-            lines.append(f"- `{art.kind}` {art.path}")
+            obj = art.as_object_ref()
+            if obj is not None:
+                jump = discord_jump_url(obj.guild_id, obj.channel_id, obj.message_id)
+                lines.append(f"- `{art.kind}` {jump}")
+            elif art.channel_id and art.message_id:
+                lines.append(
+                    f"- `{art.kind}` {art.channel_id}/{art.message_id}/{art.attachment_id}"
+                )
+            elif art.path:
+                lines.append(f"- `{art.kind}` {art.path}")
+            else:
+                lines.append(f"- `{art.kind}`")
 
     if receipt.usage:
         lines.append("")

@@ -12,3 +12,11 @@ DEFAULT_MODEL_PIN = ModelPin(
     adapter_name=ADAPTER_NAME,
     allowlist=(CANONICAL_MODEL,),
 )
+
+AGENTIC_CANONICAL_MODEL = "openrouter/auto"
+AGENTIC_ADAPTER_NAME = "openrouter/auto"
+AGENTIC_MODEL_PIN = ModelPin(
+    canonical=AGENTIC_CANONICAL_MODEL,
+    adapter_name=AGENTIC_ADAPTER_NAME,
+    allowlist=(AGENTIC_CANONICAL_MODEL,),
+)

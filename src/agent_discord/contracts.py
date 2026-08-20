@@ -52,13 +52,64 @@ class ModelNotAllowedError(ValueError):
 
 
 @dataclass(frozen=True)
+class DiscordAttachment:
+    """Attachment metadata from a Discord message. Never a durable CDN URL."""
+
+    attachment_id: str
+    filename: str
+    size: int
+    content_type: str = ""
+    sha256: str = ""
+
+
+@dataclass(frozen=True)
+class DiscordObjectRef:
+    """Durable pointer to a Discord-hosted object. No `url` field — CDN links expire."""
+
+    channel_id: str
+    message_id: str
+    attachment_id: str
+    filename: str
+    kind: str
+    size: int
+    sha256: str
+    guild_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    content_type: str = ""
+
+
+class ObjectTooLargeError(ValueError):
+    """Raised when put() exceeds the configured Discord object size limit."""
+
+
+class ObjectIntegrityError(ValueError):
+    """Raised when downloaded bytes do not match the stored sha256."""
+
+
+class ObjectNotFoundError(LookupError):
+    """Raised when a message/attachment is missing or the channel ACL does not match."""
+
+
+@dataclass(frozen=True)
 class DiscordMessage:
     channel_id: str
     content: str
     message_id: str = ""
     thread_id: Optional[str] = None
     author_id: Optional[str] = None
+    attachments: Sequence[DiscordAttachment] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+def discord_jump_url(
+    guild_id: Optional[str],
+    channel_id: str,
+    message_id: str,
+) -> str:
+    """Stable Discord client link. Uses @me when guild_id is absent."""
+
+    guild = guild_id if guild_id else "@me"
+    return f"https://discord.com/channels/{guild}/{channel_id}/{message_id}"
 
 
 @dataclass(frozen=True)
@@ -93,6 +144,31 @@ class ArtifactRef:
     kind: str
     path: str
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    channel_id: str = ""
+    message_id: str = ""
+    attachment_id: str = ""
+    sha256: str = ""
+    size: int = 0
+    filename: str = ""
+
+    def as_object_ref(self) -> Optional[DiscordObjectRef]:
+        """Return a Discord pointer when channel/message/attachment ids are present."""
+
+        if not (self.channel_id and self.message_id and self.attachment_id):
+            return None
+        guild = self.provenance.get("guild_id") if isinstance(self.provenance, Mapping) else None
+        thread = self.provenance.get("thread_id") if isinstance(self.provenance, Mapping) else None
+        return DiscordObjectRef(
+            channel_id=self.channel_id,
+            message_id=self.message_id,
+            attachment_id=self.attachment_id,
+            filename=self.filename,
+            kind=self.kind,
+            size=self.size,
+            sha256=self.sha256,
+            guild_id=str(guild) if guild else None,
+            thread_id=str(thread) if thread else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -166,7 +242,7 @@ class DispatchResult:
 
 @runtime_checkable
 class DiscordMCPProvider(Protocol):
-    """Normalized Discord/MCP provider surface (SaseQ, BrainDAO, or fake)."""
+    """Normalized Discord provider surface (REST, SaseQ, BrainDAO, or fake)."""
 
     name: str
 
@@ -196,6 +272,25 @@ class DiscordMCPProvider(Protocol):
         title: str,
         content: str,
     ) -> DiscordMessage: ...
+
+    def send_attachment(
+        self,
+        channel_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        content: str = "",
+        thread_id: Optional[str] = None,
+    ) -> DiscordMessage: ...
+
+    def get_message(self, channel_id: str, message_id: str) -> DiscordMessage: ...
+
+    def download_attachment(
+        self,
+        channel_id: str,
+        message_id: str,
+        attachment_id: str,
+    ) -> bytes: ...
 
 
 @runtime_checkable

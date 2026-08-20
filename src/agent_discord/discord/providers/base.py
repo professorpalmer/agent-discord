@@ -29,8 +29,27 @@ class MCPTransport(Protocol):
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> ToolInvocationResult: ...
 
 
-_MCP_CLIENT_INFO = {"name": "agent-discord", "version": "0.1.0"}
+_MCP_CLIENT_INFO = {"name": "discord-os", "version": "0.3.0"}
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+_SESSION_HEADER = "Mcp-Session-Id"
+
+
+def parse_mcp_http_body(raw: str) -> Any:
+    """Parse a JSON-RPC body or a streamable-HTTP SSE envelope."""
+
+    text = (raw or "").strip()
+    if not text:
+        raise json.JSONDecodeError("empty MCP body", raw or "", 0)
+    if text.startswith("{") or text.startswith("["):
+        return json.loads(text)
+    data_lines = [
+        line[5:].strip()
+        for line in text.splitlines()
+        if line.startswith("data:")
+    ]
+    if not data_lines:
+        raise json.JSONDecodeError("SSE MCP body had no data: line", raw, 0)
+    return json.loads(data_lines[-1])
 
 
 @dataclass
@@ -46,6 +65,7 @@ class HttpJsonMCPClient:
     timeout_seconds: float = 30.0
     _id: int = field(default=0, init=False)
     _initialized: bool = field(default=False, init=False)
+    _session_id: str = field(default="", init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def list_tools(self) -> Sequence[ToolDescriptor]:
@@ -109,15 +129,30 @@ class HttpJsonMCPClient:
         req = urllib.request.Request(
             self.base_url,
             data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._headers(),
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                self._capture_session(resp)
                 resp.read()
         except urllib.error.URLError:
             # Notification best-effort; many HTTP MCP servers ignore it.
             return
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            headers[_SESSION_HEADER] = self._session_id
+        return headers
+
+    def _capture_session(self, resp: Any) -> None:
+        session = resp.headers.get(_SESSION_HEADER) or resp.headers.get("mcp-session-id")
+        if session:
+            self._session_id = str(session)
 
     def _rpc(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
         self._id += 1
@@ -128,12 +163,13 @@ class HttpJsonMCPClient:
         req = urllib.request.Request(
             self.base_url,
             data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._headers(),
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                self._capture_session(resp)
+                data = parse_mcp_http_body(resp.read().decode("utf-8"))
         except urllib.error.URLError as exc:
             raise DiscordMCPError(f"HTTP MCP request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
