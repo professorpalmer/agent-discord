@@ -80,6 +80,25 @@ def render_open_card(
     return redact_text_markers("\n".join(lines))
 
 
+def render_host_card(
+    *,
+    armed: bool,
+    channel_id: str = "",
+) -> str:
+    power = "on" if armed else "off"
+    lines = [
+        f"{CARD_PREFIX} HOST",
+        f"Power: `{power}`",
+    ]
+    if channel_id:
+        lines.append(f"Channel: `{channel_id}`")
+    if armed:
+        lines.append("Accepting work. Press Off to stop.")
+    else:
+        lines.append("Stopped. Press On to start.")
+    return redact_text_markers("\n".join(lines))
+
+
 def render_overflow_card(
     *,
     filename: str,

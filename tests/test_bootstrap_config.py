@@ -76,6 +76,8 @@ def test_bootstrap_creates_workspace_and_db(tmp_path: Path, monkeypatch):
     assert info["product"] == "Discord OS"
     assert info["puppetmaster_adapter_name"] == "grok-4.5"
     assert info["agent_backend"] == "puppetmaster"
+    assert (tmp_path / ".env").is_file()
+    assert "DISCORD_BOT_TOKEN=" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
 def test_marionette_backend_requires_base_url(tmp_path: Path):

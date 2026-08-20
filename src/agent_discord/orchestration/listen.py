@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from agent_discord.contracts import DiscordMessage, RunReceipt, TaskIntake
+from agent_discord.host.power import is_power_command, parse_power_command
 from agent_discord.host.verbs import handle_open_message, is_open_command
 from agent_discord.keys.connect import (
     handle_connect_message,
     is_connect_command,
     parse_connect_command,
 )
-from agent_discord.orchestration.cards import is_harness_card
+from agent_discord.orchestration.cards import is_harness_card, render_host_card
 
 DISCORD_EPOCH_MS = 1_420_070_400_000
 LISTEN_HISTORY_SLACK_MS = 15_000
@@ -199,7 +200,31 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
+        if is_power_command(message.content or ""):
+            _absorb_power(
+                message,
+                discord=discord,
+                orchestrator=orchestrator,
+                channel_id=channel_id,
+                thread_id=message.thread_id or thread_id,
+            )
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
         if is_open_command(message.content or ""):
+            if not _channel_is_armed(store, channel_id):
+                _claim_inbound(store, discord, message, channel_id)
+                publish_host_card(
+                    discord,
+                    store,
+                    channel_id,
+                    thread_id=message.thread_id or thread_id,
+                )
+                watermark = _advance_listen_watermark(
+                    store, channel_id, created_ms, message.message_id, watermark
+                )
+                continue
             _absorb_open(
                 message,
                 discord=discord,
@@ -215,6 +240,11 @@ def drain_inbound(
             )
             continue
         if not should_dispatch_inbound(message):
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
+        if not _channel_is_armed(store, channel_id):
             watermark = _advance_listen_watermark(
                 store, channel_id, created_ms, message.message_id, watermark
             )
@@ -311,3 +341,100 @@ def _absorb_open(
     poster = getattr(discord, "send_message", None)
     if callable(poster) and result.card:
         poster(channel_id, result.card, thread_id=thread_id)
+
+
+def _channel_is_armed(store: Any, channel_id: str) -> bool:
+    reader = getattr(store, "host_is_armed", None)
+    if not callable(reader):
+        return True
+    return bool(reader(channel_id, default=True))
+
+
+def _claim_inbound(store: Any, discord: Any, message: DiscordMessage, channel_id: str) -> None:
+    if store is not None and message.message_id:
+        claim = getattr(store, "claim_inbound_message", None)
+        if callable(claim):
+            claim(message.message_id, channel_id)
+    observe = getattr(discord, "observe_message_id", None)
+    if callable(observe) and message.message_id:
+        try:
+            observe(message.message_id)
+        except Exception:
+            pass
+
+
+def _absorb_power(
+    message: DiscordMessage,
+    *,
+    discord: Any,
+    orchestrator: Any,
+    channel_id: str,
+    thread_id: Optional[str],
+) -> None:
+    store = getattr(orchestrator, "store", None)
+    _claim_inbound(store, discord, message, channel_id)
+    parsed = parse_power_command(message.content or "")
+    writer = getattr(store, "set_host_control", None)
+    if parsed.action in {"on", "off"} and callable(writer):
+        writer(channel_id, armed=parsed.action == "on")
+    publish_host_card(discord, store, channel_id, thread_id=thread_id)
+
+
+def publish_host_card(
+    discord: Any,
+    store: Any,
+    channel_id: str,
+    *,
+    thread_id: Optional[str] = None,
+) -> None:
+    """Post or edit the HOST card. Best-effort — never raise on the listen path."""
+
+    from agent_discord.host.panel import host_panel_components
+
+    armed = _channel_is_armed(store, channel_id)
+    card = render_host_card(armed=armed, channel_id=channel_id)
+    control = None
+    reader = getattr(store, "get_host_control", None)
+    if callable(reader):
+        try:
+            control = reader(channel_id)
+        except Exception:
+            control = None
+    card_id = str((control or {}).get("card_message_id") or "")
+    buttons = host_panel_components(armed)
+    editor = getattr(discord, "edit_message", None)
+    if card_id and callable(editor):
+        try:
+            editor(channel_id, card_id, card, components=buttons)
+            return
+        except TypeError:
+            try:
+                editor(channel_id, card_id, card)
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+    poster = getattr(discord, "send_message", None)
+    if not callable(poster):
+        return
+    try:
+        posted = poster(channel_id, card, thread_id=thread_id, components=buttons)
+    except TypeError:
+        try:
+            posted = poster(channel_id, card, thread_id=thread_id)
+        except Exception:
+            return
+    except Exception:
+        return
+    message_id = ""
+    if isinstance(posted, list) and posted:
+        message_id = str(getattr(posted[0], "message_id", "") or "")
+    else:
+        message_id = str(getattr(posted, "message_id", "") or "")
+    writer = getattr(store, "set_host_control", None)
+    if message_id and callable(writer):
+        try:
+            writer(channel_id, card_message_id=message_id)
+        except Exception:
+            pass

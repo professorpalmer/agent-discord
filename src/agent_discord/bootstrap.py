@@ -12,6 +12,11 @@ from agent_discord.persistence.sqlite import SQLiteStore
 
 
 BOOTSTRAP_MARKER = "bootstrap.json"
+MINIMAL_ENV = """# Discord OS — fill these in. Never commit real tokens.
+DISCORD_BOT_TOKEN=
+DISCORD_APPLICATION_ID=
+OPENROUTER_API_KEY=
+"""
 
 
 def bootstrap_workspace(
@@ -49,8 +54,11 @@ def bootstrap_workspace(
     env_example = Path.cwd() / ".env.example"
     env_target = Path.cwd() / ".env"
     created_env = False
-    if env_example.is_file() and not env_target.exists():
-        env_target.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+    if not env_target.exists():
+        if env_example.is_file():
+            env_target.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            env_target.write_text(MINIMAL_ENV, encoding="utf-8")
         created_env = True
 
     return {

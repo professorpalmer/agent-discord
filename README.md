@@ -1,40 +1,66 @@
 # Discord OS
 
-**Discord is the OS.** This process is the harness. Your phone is the client.
+Discord is the screen. This process is the computer. Your phone is the remote.
 
-The GitHub repo stays [`professorpalmer/agent-discord`](https://github.com/professorpalmer/agent-discord). The `agent-discord` command is still accepted. Env vars and the `.agent-discord` workspace directory stay as they are.
+This is **your** bot on **your** machine. There is no hosted fleet to invite. Leave the host running; turn work on and off from Discord.
 
-You bring a Discord bot token and an OpenRouter key. `listen` polls your staff channel over official Discord REST — no Docker MCP, no Gateway, no public URL, no slash commands. Type a task in Discord; the host machine runs Puppetmaster. `/open` opens Terminal, the file manager, or an allowlisted browser on that host.
+The GitHub repo is [`professorpalmer/agent-discord`](https://github.com/professorpalmer/agent-discord). The `agent-discord` command still works. Env vars and the `.agent-discord` workspace directory stay as they are.
 
-This is **not** a hosted bot you invite and forget. There is no Cary-operated fleet. Slash commands and Cloudflare tunnels are opt-in chrome, not the product.
+## 1. Make a Discord bot
 
-## Ten-minute start
+Do this once in a browser.
 
-1. Create a Discord application. Copy the **Bot** token (`xxx.yyy.zzz`) from the Bot tab — not the Application ID, not the OAuth client secret.
-2. Enable Message Content Intent on the Bot tab.
-3. Put the token in `DISCORD_BOT_TOKEN` or `~/.pmharness/.discord_token` (mode 0600).
-4. Set `DISCORD_APPLICATION_ID` to the numeric Application ID, then invite the bot:
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and sign in.
+2. **New Application**. Name it whatever you want (this is the bot people will see).
+3. Left sidebar → **Bot**.
+4. **Reset Token** / **Copy**. The token looks like `xxx.yyy.zzz`. That is `DISCORD_BOT_TOKEN`.
+   - Do **not** use Application ID.
+   - Do **not** use the OAuth client secret.
+5. On the same Bot page, enable **Message Content Intent**. Save changes.
+6. Left sidebar → **General Information**. Copy **Application ID** (digits only). That is `DISCORD_APPLICATION_ID`.
+7. In Discord, create or pick a private staff channel. Copy its channel ID (Developer Mode → right-click the channel → Copy Channel ID).
+
+## 2. Install once on the machine that will do the work
+
+Python 3.11+. From a clone of `dev` today (`pip install discord-os` after PyPI):
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e .
-pip install puppetmaster-ai    # compute kernel; not bundled
+pip install puppetmaster-ai        # compute kernel; not bundled
+export OPENROUTER_API_KEY=...      # never commit
 discord-os bootstrap
-# paste DISCORD_BOT_TOKEN and DISCORD_APPLICATION_ID into .env
-discord-os invite
-discord-os check --live
 ```
 
-5. Bind compute and listen:
+Put these in `.env` (or write the bot token to `~/.pmharness/.discord_token`, mode 0600):
 
 ```bash
-export OPENROUTER_API_KEY=...   # never commit
-discord-os connect --from-env
-discord-os listen --channel-id YOUR_CHANNEL_ID
+DISCORD_BOT_TOKEN=xxx.yyy.zzz
+DISCORD_APPLICATION_ID=123456789012345678
 ```
 
-From Discord (or your phone): `/connect` if the key is already on the host, then a normal sentence as a task, or `/open terminal`.
+Then one command:
 
-Default provider is `rest`. SaseQ/BrainDAO MCP is optional if you already run those servers.
+```bash
+discord-os setup --channel-id YOUR_CHANNEL_ID
+```
+
+That invites the bot (open the printed URL), installs a login helper so it comes back after reboot, and posts a HOST card in the channel with **On** and **Off** buttons. You do not type commands in Discord after this.
+
+## 3. Use it from Discord
+
+| In Discord | What happens |
+|---|---|
+| **On** | Starts work on the host. Type a normal sentence as a task. |
+| **Off** | Stops work. The helper stays so On still works from your phone. |
+| a normal sentence | A task, only while On. |
+
+If Discord logs the bot out, work stops. The login helper starts again idle.
+
+No Docker. No slash commands. No public URL. No `/on` to remember.
+
+Default I/O is Discord REST. SaseQ/BrainDAO MCP is optional if you already run those servers.
 
 ## Thesis
 
@@ -61,7 +87,7 @@ Two piles exist. We are neither.
 
 Discord has said: if you host files on Discord, find a more suitable service. Honest S3 replacement here means **agent artifacts under Discord size limits in your own staff channel**. It does not mean a public CDN.
 
-Default live I/O is **Discord REST** with the Bot token (`DISCORD_BOT_TOKEN` or `~/.pmharness/.discord_token`). That value is the Bot token (`xxx.yyy.zzz`) from the Bot tab — not the Application client ID and not the OAuth client secret. Optional SaseQ/BrainDAO MCP adapters try file-tool names first; if the catalog has no file tool they fall back to the same REST path. We still refuse to base64-dump files into `send_message`. The fake provider is the hermetic proof of the protocol. REST listen does **not** open a Discord Gateway, so it can sit beside an existing MCP Gateway process.
+Default live I/O is **Discord REST** with the Bot token (`DISCORD_BOT_TOKEN` or `~/.pmharness/.discord_token`). That value is the Bot token (`xxx.yyy.zzz`) from the Bot tab — not the Application client ID and not the OAuth client secret. Optional SaseQ/BrainDAO MCP adapters try file-tool names first; if the catalog has no file tool they fall back to the same REST path. We still refuse to base64-dump files into `send_message`. The fake provider is the hermetic proof of the protocol. Foreground `listen` does **not** open a Discord Gateway. `host` / `setup` opens a Gateway **only** so On/Off buttons work — no public URL. Do not run that beside another bot process that already owns the Gateway.
 
 ## Honest limits
 
@@ -75,7 +101,7 @@ Default live I/O is **Discord REST** with the Bot token (`DISCORD_BOT_TOKEN` or 
 ## What a run does
 
 1. **Connect** (optional): `/connect` on the listen host inherits `OPENROUTER_API_KEY`, shreds a pasted secret after delete, or mints a pairing ticket for `discord-os connect --ticket`.
-2. **Intake** a natural-language task from `run` or `listen` (staff channel / phone). `listen` skips receipts, `**Card**` harness cards, progress lines, and object-store captions. Connect and open commands are intercepted before task dispatch. Discord is the remote; this process opens Terminal, the file manager, or an allowlisted browser on the listen host.
+2. **Intake** a natural-language task from `run` or the host loop (staff channel / phone). Cards, receipts, and object-store captions are skipped. On/Off buttons, `/connect`, and `/open` are intercepted before task dispatch. Work is accepted only while On. Discord is the remote; this process opens Terminal, the file manager, or an allowlisted browser on the host.
 3. **Snapshot** scoped context from SQLite memory + channel bindings.
 4. **Dispatch** to Puppetmaster agentic (OpenRouter/BYOK) or the Cursor pin, depending on resolved compute.
 5. **Persist** events, then **put** backend file artifacts through the object store (overflow pointer + stash when over the cap). Local path is kept if put fails.
@@ -183,6 +209,10 @@ The adapter documents an expected session/job/events/status/cancel contract; it 
 discord-os bootstrap [--workspace PATH]
 discord-os check [--allow-empty-token] [--live] [--channel-id ID]
 discord-os run TASK --channel-id ID [--message-id ID] [--fake] [--no-discord-post] [--json]
+discord-os setup --channel-id ID
+discord-os host start --channel-id ID
+discord-os host stop
+discord-os host status
 discord-os listen --channel-id ID [--once] [--interval SEC] [--fake] [--json]
 discord-os connect [--provider openrouter] [--ticket T] [--from-env] [--json]
 discord-os status [--json]
@@ -208,7 +238,7 @@ CLI → Orchestrator → backend (Puppetmaster agentic | Puppetmaster cursor | o
                   ↘ Discord facade → object store → REST (default) | optional SaseQ/BrainDAO | fake
 ```
 
-REST listen does not open a Discord Gateway. The SQLite gateway row is a local one-process lock and is stolen if the previous owner pid is dead.
+Message intake is REST. The host process opens a Discord Gateway only for On/Off buttons. The SQLite gateway row is a local one-process lock and is stolen if the previous owner pid is dead.
 
 - **stdlib-first** core; optional `pytest` for development.
 - Explicit typed contracts + dependency injection — tests never need Discord, Cursor, or network.

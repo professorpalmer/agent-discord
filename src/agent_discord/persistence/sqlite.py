@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS listen_watermarks (
     last_message_id TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS host_control (
+    channel_id TEXT PRIMARY KEY,
+    armed INTEGER NOT NULL DEFAULT 1,
+    card_message_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -654,6 +661,67 @@ class SQLiteStore:
             "channel_id": channel_id,
             "last_created_ms": created_ms,
             "last_message_id": "",
+        }
+
+    def get_host_control(self, channel_id: str) -> Optional[dict[str, Any]]:
+        row = self._connection().execute(
+            """
+            SELECT channel_id, armed, card_message_id
+            FROM host_control
+            WHERE channel_id=?
+            """,
+            (channel_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "channel_id": str(row["channel_id"]),
+            "armed": bool(int(row["armed"])),
+            "card_message_id": str(row["card_message_id"] or ""),
+        }
+
+    def host_is_armed(self, channel_id: str, *, default: bool = True) -> bool:
+        row = self.get_host_control(channel_id)
+        if row is None:
+            return default
+        return bool(row["armed"])
+
+    def set_host_control(
+        self,
+        channel_id: str,
+        *,
+        armed: Optional[bool] = None,
+        card_message_id: Optional[str] = None,
+        default_armed: bool = True,
+    ) -> dict[str, Any]:
+        current = self.get_host_control(channel_id)
+        next_armed = default_armed if current is None else bool(current["armed"])
+        next_card = "" if current is None else str(current["card_message_id"] or "")
+        if armed is not None:
+            next_armed = bool(armed)
+        if card_message_id is not None:
+            next_card = str(card_message_id)
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO host_control (
+                channel_id, armed, card_message_id, updated_at
+            ) VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(channel_id) DO UPDATE SET
+                armed=excluded.armed,
+                card_message_id=excluded.card_message_id,
+                updated_at=datetime('now')
+            """,
+            (channel_id, 1 if next_armed else 0, next_card),
+        )
+        conn.commit()
+        stored = self.get_host_control(channel_id)
+        if stored is not None:
+            return stored
+        return {
+            "channel_id": channel_id,
+            "armed": next_armed,
+            "card_message_id": next_card,
         }
 
     def set_listen_watermark(

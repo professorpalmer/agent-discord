@@ -57,12 +57,20 @@ class DiscordFacade:
         *,
         thread_id: Optional[str] = None,
         chunk_limit: int = 2000,
+        components: Optional[list] = None,
     ) -> list[DiscordMessage]:
         """Send content, chunking as needed; return all posted messages."""
         chunks = _chunks_for_inbound_skip(content, chunk_limit)
         posted: list[DiscordMessage] = []
-        for chunk in chunks:
-            msg = self.provider.send_message(channel_id, chunk, thread_id=thread_id)
+        last = len(chunks) - 1
+        for index, chunk in enumerate(chunks):
+            kwargs: dict = {"thread_id": thread_id}
+            if components is not None and index == last:
+                kwargs["components"] = components
+            try:
+                msg = self.provider.send_message(channel_id, chunk, **kwargs)
+            except TypeError:
+                msg = self.provider.send_message(channel_id, chunk, thread_id=thread_id)
             self._remember_outbound(msg)
             posted.append(msg)
         return posted
@@ -132,10 +140,20 @@ class DiscordFacade:
         channel_id: str,
         message_id: str,
         content: str,
+        *,
+        components: Optional[list] = None,
     ) -> DiscordMessage:
         method = getattr(self.provider, "edit_message", None)
         if callable(method):
-            msg = method(channel_id, message_id, content)
+            try:
+                msg = method(
+                    channel_id,
+                    message_id,
+                    content,
+                    components=components,
+                )
+            except TypeError:
+                msg = method(channel_id, message_id, content)
             self._remember_outbound(msg)
             return msg
         result = self._invoke_first(

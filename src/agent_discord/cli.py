@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -45,7 +46,22 @@ from agent_discord.keys.connect import (
     redeem_pairing_ticket,
 )
 from agent_discord.keys.vault import KeyVault
-from agent_discord.orchestration.listen import LISTEN_HISTORY_SLACK_MS, drain_inbound
+from agent_discord.host.install import install_login_host
+from agent_discord.host.service import (
+    clear_host_meta,
+    host_log_path,
+    host_run_argv,
+    read_host_meta,
+    running_host_pid,
+    start_detached,
+    stop_host,
+    write_host_meta,
+)
+from agent_discord.orchestration.listen import (
+    LISTEN_HISTORY_SLACK_MS,
+    drain_inbound,
+    publish_host_card,
+)
 from agent_discord.orchestration.orchestrator import AgentOrchestrator
 from agent_discord.orchestration.receipts import render_receipt
 from agent_discord.persistence.research import ResearchMemoryStore
@@ -151,9 +167,72 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--fake", action="store_true", help="Use local workspace only (no network)")
     p_ls.add_argument("--json", action="store_true", help="Print pointer JSON (no url key)")
 
+    p_setup = sub.add_parser(
+        "setup",
+        help="One-time: invite, login helper, and On/Off panel in Discord",
+    )
+    p_setup.add_argument("--channel-id", required=True, help="Discord channel id (ACL)")
+    p_setup.add_argument("--workspace-id", default="default")
+    p_setup.add_argument("--json", action="store_true")
+
+    p_host = sub.add_parser(
+        "host",
+        help="Headless host: On/Off buttons in Discord start and stop work",
+    )
+    host_sub = p_host.add_subparsers(dest="host_command", required=True)
+    p_host_start = host_sub.add_parser("start", help="Detach a host process for one channel")
+    p_host_start.add_argument("--channel-id", required=True, help="Discord channel id (ACL)")
+    p_host_start.add_argument(
+        "--workspace-id",
+        default="default",
+        help="Logical workspace id for bindings/memory (default: default)",
+    )
+    p_host_start.add_argument("--guild-id", default=None)
+    p_host_start.add_argument("--thread-id", default=None)
+    p_host_start.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        help="Seconds between polls (default: 5)",
+    )
+    p_host_start.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Messages to read per drain (default: 20)",
+    )
+    p_host_start.add_argument(
+        "--fake",
+        action="store_true",
+        help="Use fake Discord + fake Puppetmaster (tests)",
+    )
+    p_host_start.add_argument(
+        "--no-discord-post",
+        action="store_true",
+        help="Skip posting progress/receipts to Discord",
+    )
+    p_host_start.add_argument("--json", action="store_true")
+    host_sub.add_parser("stop", help="Stop the detached host process")
+    p_host_status = host_sub.add_parser("status", help="Show whether the host is running and armed")
+    p_host_status.add_argument("--json", action="store_true")
+    p_host_run = host_sub.add_parser(
+        "run",
+        help="Foreground host loop (used by host start; prefer host start)",
+    )
+    p_host_run.add_argument("--channel-id", required=True, help="Discord channel id (ACL)")
+    p_host_run.add_argument("--workspace-id", default="default")
+    p_host_run.add_argument("--guild-id", default=None)
+    p_host_run.add_argument("--thread-id", default=None)
+    p_host_run.add_argument("--interval", type=float, default=5.0)
+    p_host_run.add_argument("--limit", type=int, default=20)
+    p_host_run.add_argument("--once", action="store_true")
+    p_host_run.add_argument("--fake", action="store_true")
+    p_host_run.add_argument("--no-discord-post", action="store_true")
+    p_host_run.add_argument("--json", action="store_true")
+
     p_listen = sub.add_parser(
         "listen",
-        help="Drain a Discord channel into task runs (phone / staff-channel intake)",
+        help="Foreground drain (debug). Leave-running path is host start.",
     )
     p_listen.add_argument("--channel-id", required=True, help="Discord channel id (ACL)")
     p_listen.add_argument(
@@ -726,13 +805,45 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     )
     claimed = False
     exit_code = 0
+    panel_stop = threading.Event()
+    discord_down = threading.Event()
     ignore_history_before_ms = int(time.time() * 1000) - LISTEN_HISTORY_SLACK_MS
     try:
-        # Local process lock. REST never opens a Discord Gateway.
+        # Local process lock. Message intake stays REST. Host run opens a
+        # Discord Gateway only so On/Off buttons work (no public URL).
         if not args.fake and config.discord_bot_token:
             discord.claim_gateway()
             claimed = True
+        if getattr(args, "announce_host", False):
+            write_host_meta(
+                config.workspace,
+                pid=os.getpid(),
+                channel_id=args.channel_id,
+            )
+            store.set_host_control(args.channel_id, default_armed=False)
+            if not args.no_discord_post:
+                publish_host_card(
+                    discord,
+                    store,
+                    args.channel_id,
+                    thread_id=args.thread_id,
+                )
+            if (
+                not args.fake
+                and config.discord_bot_token
+                and config.discord_mcp_provider == "rest"
+            ):
+                _start_panel_gateway(
+                    token=config.discord_bot_token,
+                    store=store,
+                    channel_id=args.channel_id,
+                    stop=panel_stop,
+                    discord_down=discord_down,
+                )
         while True:
+            if discord_down.is_set():
+                exit_code = 1
+                break
             receipts = drain_inbound(
                 orch,
                 discord,
@@ -779,9 +890,224 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             if claimed:
                 discord.release_gateway()
         finally:
+            panel_stop.set()
+            if getattr(args, "announce_host", False):
+                meta = read_host_meta(config.workspace)
+                try:
+                    owned = int(meta.get("pid") or 0) == os.getpid()
+                except (TypeError, ValueError):
+                    owned = False
+                if owned:
+                    clear_host_meta(config.workspace)
             discord.close()
             store.close()
     return exit_code
+
+
+def _start_panel_gateway(
+    *,
+    token: str,
+    store: SQLiteStore,
+    channel_id: str,
+    stop: threading.Event,
+    discord_down: threading.Event,
+) -> None:
+    def on_dispatch(event: str, payload: dict) -> None:
+        if event != "INTERACTION_CREATE":
+            return
+        from agent_discord.host.panel import handle_gateway_interaction
+
+        handle_gateway_interaction(store, channel_id, payload)
+
+    def loop() -> None:
+        from agent_discord.discord.realtime import GatewayClosed, run_discord_gateway
+
+        while not stop.is_set():
+            try:
+                run_discord_gateway(token, on_dispatch, stop=stop)
+            except GatewayClosed as exc:
+                if exc.fatal:
+                    try:
+                        store.set_host_control(channel_id, armed=False)
+                    except Exception:
+                        pass
+                    discord_down.set()
+                    return
+                time.sleep(2)
+            else:
+                return
+
+    threading.Thread(target=loop, name="discord-os-panel", daemon=True).start()
+
+
+def cmd_setup(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    config = apply_runtime_secrets(load_config())
+    if not describe_bootstrap(config).get("bootstrapped"):
+        bootstrap_workspace(workspace=config.workspace)
+        config = apply_runtime_secrets(load_config())
+    problems = check_config(config, require_token=True)
+    if problems:
+        print("setup: fix these first:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 1
+    from agent_discord.discord.invite import InviteError, bot_invite_url
+    from agent_discord.keys.connect import bind_host_key, host_provider_secret
+
+    if host_provider_secret("openrouter"):
+        bind_host_key(workspace=config.workspace, provider="openrouter", source="env")
+    invite = ""
+    try:
+        invite = bot_invite_url(config.discord_application_id)
+    except InviteError:
+        invite = ""
+    start_args = argparse.Namespace(
+        channel_id=args.channel_id,
+        workspace_id=args.workspace_id,
+        guild_id=None,
+        thread_id=None,
+        interval=5.0,
+        limit=20,
+        fake=False,
+        no_discord_post=False,
+        json=args.json,
+    )
+    code = cmd_host_start(start_args, out=out)
+    if not args.json and invite:
+        print(f"invite: {invite}", file=out)
+        print("Press On in the HOST card after the bot is in the channel.", file=out)
+    return code
+
+
+def cmd_host(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    command = getattr(args, "host_command", None)
+    if command == "start":
+        return cmd_host_start(args, out=out)
+    if command == "stop":
+        return cmd_host_stop(args, out=out)
+    if command == "status":
+        return cmd_host_status(args, out=out)
+    if command == "run":
+        args.announce_host = True
+        return cmd_listen(args, out=out)
+    print("host: start, stop, status, or run", file=sys.stderr)
+    return 2
+
+
+def cmd_host_start(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    config = apply_runtime_secrets(load_config())
+    config.workspace.mkdir(parents=True, exist_ok=True)
+    (config.workspace / "logs").mkdir(parents=True, exist_ok=True)
+    store = SQLiteStore(config.database_path)
+    store.initialize()
+    control =     store.set_host_control(args.channel_id, default_armed=False)
+    installed = install_login_host(
+        channel_id=args.channel_id,
+        workspace=config.workspace,
+        cwd=Path.cwd(),
+    )
+    live = running_host_pid(config.workspace)
+    if live is not None:
+        print(f"host: already running pid={live}", file=sys.stderr)
+        store.close()
+        return 1
+    for _ in range(8):
+        time.sleep(0.15)
+        live = running_host_pid(config.workspace)
+        if live is not None:
+            store.close()
+            payload = {
+                "pid": live,
+                "channel_id": args.channel_id,
+                "armed": bool(control.get("armed")),
+                "log": str(host_log_path(config.workspace)),
+                "login": installed,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2), file=out)
+            else:
+                print(f"host running pid={live} channel={args.channel_id}", file=out)
+                print("Discord: press On to start, Off to stop", file=out)
+            return 0
+    extra = [
+        "--interval",
+        str(args.interval),
+        "--limit",
+        str(args.limit),
+        "--workspace-id",
+        args.workspace_id,
+    ]
+    if args.guild_id:
+        extra.extend(["--guild-id", args.guild_id])
+    if args.thread_id:
+        extra.extend(["--thread-id", args.thread_id])
+    if args.fake:
+        extra.append("--fake")
+    if args.no_discord_post:
+        extra.append("--no-discord-post")
+    pid = start_detached(
+        host_run_argv(args.channel_id, extra=extra),
+        workspace=config.workspace,
+        channel_id=args.channel_id,
+        cwd=Path.cwd(),
+    )
+    store.close()
+    payload = {
+        "pid": pid,
+        "channel_id": args.channel_id,
+        "armed": bool(control.get("armed")),
+        "log": str(host_log_path(config.workspace)),
+        "login": installed,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2), file=out)
+    else:
+        print(f"host started pid={pid} channel={args.channel_id}", file=out)
+        print("Discord: press On to start, Off to stop", file=out)
+        print(f"log: {payload['log']}", file=out)
+    return 0
+
+
+def cmd_host_stop(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    config = load_config()
+    pid = stop_host(config.workspace)
+    if pid is None:
+        print("host: not running", file=out)
+        return 0
+    print(f"host stopped pid={pid}", file=out)
+    return 0
+
+
+def cmd_host_status(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    config = apply_runtime_secrets(load_config())
+    meta = read_host_meta(config.workspace)
+    pid = running_host_pid(config.workspace)
+    channel_id = str(meta.get("channel_id") or "")
+    store = SQLiteStore(config.database_path)
+    store.initialize()
+    armed = store.host_is_armed(channel_id, default=True) if channel_id else None
+    store.close()
+    payload = {
+        "running": pid is not None,
+        "pid": pid,
+        "channel_id": channel_id,
+        "armed": armed,
+        "log": str(host_log_path(config.workspace)),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2), file=out)
+    else:
+        state = "running" if pid is not None else "stopped"
+        power = "on" if armed else "off" if armed is False else "n/a"
+        print(f"host:   {state}" + (f" pid={pid}" if pid else ""), file=out)
+        print(f"power:  {power}", file=out)
+        if channel_id:
+            print(f"channel:{channel_id}", file=out)
+    return 0
 
 
 def cmd_connect(args: argparse.Namespace, *, out: TextIO | None = None, stdin: TextIO | None = None) -> int:
@@ -1031,6 +1357,8 @@ def cmd_interactions(args: argparse.Namespace, *, out: TextIO | None = None) -> 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "setup":
+        return cmd_setup(args)
     if args.command == "bootstrap":
         return cmd_bootstrap(args)
     if args.command == "check":
@@ -1043,6 +1371,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_get(args)
     if args.command == "ls":
         return cmd_ls(args)
+    if args.command == "host":
+        return cmd_host(args)
     if args.command == "listen":
         return cmd_listen(args)
     if args.command == "connect":

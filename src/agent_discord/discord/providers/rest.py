@@ -50,12 +50,14 @@ class RestDiscordProvider:
         content: str,
         *,
         thread_id: Optional[str] = None,
+        components: Optional[list] = None,
     ) -> DiscordMessage:
         return send_channel_message(
             token=self._bot_token,
             channel_id=channel_id,
             content=content,
             thread_id=thread_id,
+            components=components,
             opener=self._opener,
         )
 
@@ -123,12 +125,20 @@ class RestDiscordProvider:
             opener=self._opener,
         )
 
-    def edit_message(self, channel_id: str, message_id: str, content: str) -> DiscordMessage:
+    def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str,
+        *,
+        components: Optional[list] = None,
+    ) -> DiscordMessage:
         return edit_channel_message(
             token=self._bot_token,
             channel_id=channel_id,
             message_id=message_id,
             content=content,
+            components=components,
             opener=self._opener,
         )
 

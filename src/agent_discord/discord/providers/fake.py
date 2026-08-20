@@ -148,13 +148,17 @@ class FakeDiscordMCPProvider:
         content: str,
         *,
         thread_id: Optional[str] = None,
+        components: Optional[list] = None,
     ) -> DiscordMessage:
+        meta = {"provider": self.name}
+        if components:
+            meta["components"] = list(components)
         msg = DiscordMessage(
             channel_id=channel_id,
             content=content,
             message_id=f"fake-{uuid4().hex[:10]}",
             thread_id=thread_id,
-            metadata={"provider": self.name},
+            metadata=meta,
         )
         self.sent.append(msg)
         self._save_persist()
@@ -195,13 +199,23 @@ class FakeDiscordMCPProvider:
                 return msg
         raise ToolInvocationError(f"message {message_id!r} not found")
 
-    def edit_message(self, channel_id: str, message_id: str, content: str) -> DiscordMessage:
+    def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str,
+        *,
+        components: Optional[list] = None,
+    ) -> DiscordMessage:
         if "edit_message" in self.fail_tools:
             raise ToolInvocationError("forced failure")
         for collection in (self.sent, self.inbox):
             for index, msg in enumerate(collection):
                 if msg.message_id != message_id:
                     continue
+                meta = dict(msg.metadata)
+                if components is not None:
+                    meta["components"] = list(components)
                 updated = DiscordMessage(
                     channel_id=msg.channel_id or channel_id,
                     content=content,
@@ -209,7 +223,7 @@ class FakeDiscordMCPProvider:
                     thread_id=msg.thread_id,
                     author_id=msg.author_id,
                     attachments=msg.attachments,
-                    metadata=dict(msg.metadata),
+                    metadata=meta,
                 )
                 collection[index] = updated
                 self._save_persist()

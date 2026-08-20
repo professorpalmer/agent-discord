@@ -91,14 +91,18 @@ def send_channel_message(
     channel_id: str,
     content: str,
     thread_id: Optional[str] = None,
+    components: Optional[list[dict[str, Any]]] = None,
     opener: Optional[UrlOpener] = None,
 ) -> DiscordMessage:
     dest = thread_id or channel_id
+    payload: dict[str, Any] = {"content": content}
+    if components:
+        payload["components"] = list(components)
     raw = call_discord_json(
         token,
         "POST",
         f"/channels/{dest}/messages",
-        payload={"content": content},
+        payload=payload,
         opener=opener,
     )
     return message_from_rest_payload(
@@ -115,18 +119,54 @@ def edit_channel_message(
     channel_id: str,
     message_id: str,
     content: str,
+    components: Optional[list[dict[str, Any]]] = None,
     opener: Optional[UrlOpener] = None,
 ) -> DiscordMessage:
+    payload: dict[str, Any] = {"content": content}
+    if components is not None:
+        payload["components"] = list(components)
     raw = call_discord_json(
         token,
         "PATCH",
         f"/channels/{channel_id}/messages/{message_id}",
-        payload={"content": content},
+        payload=payload,
         opener=opener,
     )
     return message_from_rest_payload(
         raw, channel_id=channel_id, fallback_content=content
     )
+
+
+def callback_interaction(
+    *,
+    interaction_id: str,
+    interaction_token: str,
+    payload: dict[str, Any],
+    opener: Optional[UrlOpener] = None,
+) -> None:
+    """ACK a button click. Uses the interaction token, not the bot token."""
+
+    if not interaction_id.strip() or not interaction_token.strip():
+        raise ToolInvocationError("Discord interaction callback missing id/token")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        f"{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    do_open = opener or urlopen
+    try:
+        with do_open(request, timeout=10) as resp:
+            resp.read()
+    except HTTPError as exc:
+        exc.read()
+        raise ToolInvocationError(f"Discord interaction callback HTTP {exc.code}") from None
+    except URLError as exc:
+        raise ToolInvocationError("Discord interaction callback unreachable") from exc
 
 
 def delete_channel_message(
