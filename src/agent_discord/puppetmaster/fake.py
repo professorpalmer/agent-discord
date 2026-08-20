@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from agent_discord.contracts import (
+    ArtifactRef,
     DispatchEvent,
     DispatchRequest,
     DispatchResult,
@@ -27,6 +29,7 @@ class FakePuppetmasterBackend:
     fail_next: bool = False
     last_request: Optional[DispatchRequest] = None
     dispatch_count: int = 0
+    artifact_files: list[str] = field(default_factory=list)
 
     def resolve_model(self, requested: str) -> ModelPin:
         self.pin.assert_allowed(requested)
@@ -108,6 +111,7 @@ class FakePuppetmasterBackend:
             status=TaskStatus.COMPLETED,
             events=events,
             final_summary=f"Completed: {request.prompt[:200]}",
+            artifacts=tuple(self._artifact_refs()),
             usage=UsageReceipt(
                 model=pin.canonical,
                 adapter_name=pin.adapter_name,
@@ -116,6 +120,20 @@ class FakePuppetmasterBackend:
                 metadata={"backend": "fake"},
             ),
         )
+
+    def _artifact_refs(self) -> list[ArtifactRef]:
+        out: list[ArtifactRef] = []
+        for index, raw in enumerate(self.artifact_files):
+            path = Path(raw)
+            out.append(
+                ArtifactRef(
+                    artifact_id=f"fake-artifact-{index}",
+                    kind="file",
+                    path=str(path),
+                    filename=path.name,
+                )
+            )
+        return out
 
     def cancel(self, run_id: str) -> bool:
         self.cancelled.add(run_id)

@@ -6,8 +6,11 @@ from typing import Any, Mapping, Optional, Sequence
 
 from agent_discord.contracts import DiscordMessage, GatewayOwnerRegistry, ToolDescriptor, ToolInvocationResult
 from agent_discord.discord.chunking import chunk_message
-from agent_discord.discord.errors import MessageDedupError
+from agent_discord.discord.errors import MessageDedupError, ToolInvocationError
 from agent_discord.discord.gateway import InMemoryGatewayOwnerRegistry
+
+_CARD_PREFIX = "**Card**"
+_RECEIPT_PREFIX = "**Receipt**"
 
 
 class DiscordFacade:
@@ -18,7 +21,7 @@ class DiscordFacade:
         provider: Any,
         *,
         gateway: Optional[GatewayOwnerRegistry] = None,
-        owner_id: str = "agent-discord",
+        owner_id: str = "discord-os",
         bot_token_fingerprint: str = "",
         dedupe: bool = True,
     ) -> None:
@@ -56,7 +59,7 @@ class DiscordFacade:
         chunk_limit: int = 2000,
     ) -> list[DiscordMessage]:
         """Send content, chunking as needed; return all posted messages."""
-        chunks = chunk_message(content, limit=chunk_limit)
+        chunks = _chunks_for_inbound_skip(content, chunk_limit)
         posted: list[DiscordMessage] = []
         for chunk in chunks:
             msg = self.provider.send_message(channel_id, chunk, thread_id=thread_id)
@@ -96,6 +99,93 @@ class DiscordFacade:
         self._remember_outbound(msg)
         return msg
 
+    def send_attachment(
+        self,
+        channel_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        content: str = "",
+        thread_id: Optional[str] = None,
+    ) -> DiscordMessage:
+        msg = self.provider.send_attachment(
+            channel_id, filename, data, content=content, thread_id=thread_id
+        )
+        self._remember_outbound(msg)
+        return msg
+
+    def get_message(self, channel_id: str, message_id: str) -> DiscordMessage:
+        """Fetch a message for a fresh attachment handle. Do not cache CDN URLs."""
+
+        return self.provider.get_message(channel_id, message_id)
+
+    def download_attachment(
+        self,
+        channel_id: str,
+        message_id: str,
+        attachment_id: str,
+    ) -> bytes:
+        return self.provider.download_attachment(channel_id, message_id, attachment_id)
+
+    def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str,
+    ) -> DiscordMessage:
+        method = getattr(self.provider, "edit_message", None)
+        if callable(method):
+            msg = method(channel_id, message_id, content)
+            self._remember_outbound(msg)
+            return msg
+        result = self._invoke_first(
+            ("edit_message", "discord_edit_message"),
+            {
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "content": content,
+            },
+        )
+        if result is None:
+            raise ToolInvocationError(
+                "live MCP catalog has no edit_message/discord_edit_message tool"
+            )
+        return DiscordMessage(
+            channel_id=channel_id,
+            content=content,
+            message_id=message_id,
+            metadata={"tool": result.name},
+        )
+
+    def delete_message(self, channel_id: str, message_id: str) -> None:
+        method = getattr(self.provider, "delete_message", None)
+        if callable(method):
+            method(channel_id, message_id)
+            return
+        result = self._invoke_first(
+            ("delete_message", "discord_delete_message"),
+            {"channel_id": channel_id, "message_id": message_id},
+        )
+        if result is None:
+            raise ToolInvocationError(
+                "live MCP catalog has no delete_message/discord_delete_message tool"
+            )
+
+    def _invoke_first(
+        self,
+        names: Sequence[str],
+        arguments: Mapping[str, Any],
+    ) -> Optional[ToolInvocationResult]:
+        last_error = ""
+        for name in names:
+            result = self.invoke_tool(name, arguments)
+            if result.ok:
+                return result
+            last_error = result.error or last_error
+        if last_error:
+            raise ToolInvocationError(last_error)
+        return None
+
     def observe_message_id(self, message_id: str) -> None:
         """Register an inbound message id for process-local deduplication."""
         if not message_id:
@@ -124,3 +214,25 @@ class DiscordFacade:
     def _remember_outbound(self, msg: DiscordMessage) -> None:
         if msg.message_id:
             self._seen_message_ids.add(msg.message_id)
+
+
+def _chunks_for_inbound_skip(content: str, chunk_limit: int) -> list[str]:
+    """Chunk text. Repeat Card/Receipt prefixes so listen skips every piece."""
+
+    prefix = ""
+    if content.startswith(_CARD_PREFIX):
+        prefix = _CARD_PREFIX
+    elif content.startswith(_RECEIPT_PREFIX):
+        prefix = _RECEIPT_PREFIX
+    chunks = chunk_message(content, limit=chunk_limit)
+    if not prefix or len(chunks) <= 1:
+        return chunks
+    carry = f"{prefix}\n"
+    room = max(1, chunk_limit - len(carry))
+    out = [chunks[0]]
+    for piece in chunks[1:]:
+        if piece.startswith(prefix):
+            out.append(piece)
+            continue
+        out.extend(f"{carry}{part}" for part in chunk_message(piece, limit=room))
+    return out

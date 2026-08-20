@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-discord"
-version = "0.1.0"
-description = "Local Discord-native agent bridge: natural-language tasks via MCP Discord adapters and a pinned Puppetmaster backend."
+name = "discord-os"
+version = "0.3.0"
+description = "Discord OS: Discord is the harness UI for local agent work. Artifacts are Discord objects (snowflake IDs)."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "agent-discord contributors" }]
-keywords = ["discord", "mcp", "puppetmaster", "agent", "cli"]
+authors = [{ name = "Discord OS contributors" }]
+keywords = ["discord", "discord-os", "mcp", "puppetmaster", "agent", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -25,8 +25,10 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+interactions = ["PyNaCl>=1.5"]
 
 [project.scripts]
+discord-os = "agent_discord.cli:main"
 agent-discord = "agent_discord.cli:main"
 
 [project.urls]

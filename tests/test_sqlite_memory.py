@@ -94,6 +94,22 @@ def test_inbound_message_linkage(tmp_path: Path):
     store.close()
 
 
+def test_listen_watermark_seed_and_set(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "wm.sqlite3")
+    store.initialize()
+    first = store.seed_listen_watermark("ch", 1_750_000_000_000)
+    assert first["last_created_ms"] == 1_750_000_000_000
+    assert first["last_message_id"] == ""
+    again = store.seed_listen_watermark("ch", 1_760_000_000_000)
+    assert again["last_created_ms"] == 1_750_000_000_000
+    store.set_listen_watermark("ch", created_ms=1_750_000_001_000, message_id="1400123456789012345")
+    row = store.get_listen_watermark("ch")
+    assert row is not None
+    assert row["last_created_ms"] == 1_750_000_001_000
+    assert row["last_message_id"] == "1400123456789012345"
+    store.close()
+
+
 def test_sqlite_gateway_ownership_across_registries(tmp_path: Path):
     db = tmp_path / "gw.sqlite3"
     store_a = SQLiteStore(db)
@@ -115,3 +131,15 @@ def test_sqlite_gateway_ownership_across_registries(tmp_path: Path):
     assert reg_a.current_owner("tokfp") == "owner-b"
     store_a.close()
     store_b.close()
+
+
+def test_sqlite_gateway_steal_dead_cli_owner(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "gw-dead.sqlite3")
+    store.initialize()
+    store.claim_gateway("tokfp", "agent-discord-cli-99999999-dead0001")
+    store.claim_gateway("tokfp", "agent-discord-cli-88888888-next0001")
+    assert store.gateway_owner("tokfp") == "agent-discord-cli-88888888-next0001"
+    store.claim_gateway("tokfp2", "discord-os-cli-99999999-dead0001")
+    store.claim_gateway("tokfp2", "discord-os-cli-88888888-next0001")
+    assert store.gateway_owner("tokfp2") == "discord-os-cli-88888888-next0001"
+    store.close()

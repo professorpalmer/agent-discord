@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from uuid import uuid4
 
+from agent_discord import CLI_OWNER_PREFIX, LEGACY_CLI_OWNER_PREFIX
 from agent_discord.contracts import EventKind, TaskStatus
 from agent_discord.discord.errors import GatewayOwnershipError
 from agent_discord.persistence.research import RESEARCH_SCHEMA
@@ -79,7 +81,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
     task_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     kind TEXT NOT NULL,
-    path TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    channel_id TEXT,
+    message_id TEXT,
+    attachment_id TEXT,
+    filename TEXT,
+    sha256 TEXT,
+    size INTEGER,
+    content_type TEXT,
     provenance_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -97,6 +106,13 @@ CREATE TABLE IF NOT EXISTS gateway_owners (
     owner_id TEXT NOT NULL,
     claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS listen_watermarks (
+    channel_id TEXT PRIMARY KEY,
+    last_created_ms INTEGER,
+    last_message_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -112,6 +128,7 @@ class SQLiteStore:
         conn.executescript(SCHEMA)
         conn.executescript(RESEARCH_SCHEMA)
         self._migrate_seen_messages(conn)
+        self._migrate_artifacts(conn)
         self._fts_enabled = self._try_enable_fts(conn)
         conn.commit()
 
@@ -136,6 +153,23 @@ class SQLiteStore:
             conn.execute("ALTER TABLE seen_messages ADD COLUMN task_id TEXT")
         if "run_id" not in cols:
             conn.execute("ALTER TABLE seen_messages ADD COLUMN run_id TEXT")
+
+    def _migrate_artifacts(self, conn: sqlite3.Connection) -> None:
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+        }
+        for name, decl in (
+            ("channel_id", "TEXT"),
+            ("message_id", "TEXT"),
+            ("attachment_id", "TEXT"),
+            ("filename", "TEXT"),
+            ("sha256", "TEXT"),
+            ("size", "INTEGER"),
+            ("content_type", "TEXT"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {decl}")
 
     def _try_enable_fts(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -435,18 +469,27 @@ class SQLiteStore:
         task_id: str,
         run_id: str,
         kind: str,
-        path: str,
-        provenance: Mapping[str, Any],
+        path: str = "",
+        provenance: Mapping[str, Any] | None = None,
+        channel_id: str = "",
+        message_id: str = "",
+        attachment_id: str = "",
+        filename: str = "",
+        sha256: str = "",
+        size: int = 0,
+        content_type: str = "",
     ) -> None:
         conn = self._connection()
-        safe_prov = strip_forbidden_keys(dict(provenance))
+        safe_prov = strip_forbidden_keys(dict(provenance or {}))
         if not isinstance(safe_prov, dict):
             safe_prov = {}
         conn.execute(
             """
             INSERT INTO artifacts (
-                artifact_id, task_id, run_id, kind, path, provenance_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                artifact_id, task_id, run_id, kind, path,
+                channel_id, message_id, attachment_id, filename,
+                sha256, size, content_type, provenance_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 artifact_id,
@@ -454,6 +497,13 @@ class SQLiteStore:
                 run_id,
                 kind,
                 path,
+                channel_id,
+                message_id,
+                attachment_id,
+                filename,
+                sha256,
+                size,
+                content_type,
                 json.dumps(safe_prov, sort_keys=True),
             ),
         )
@@ -463,6 +513,45 @@ class SQLiteStore:
         rows = self._connection().execute(
             "SELECT * FROM artifacts WHERE run_id=? ORDER BY created_at ASC", (run_id,)
         ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["provenance"] = json.loads(item.pop("provenance_json") or "{}")
+            out.append(item)
+        return out
+
+    def list_objects(
+        self,
+        channel_id: str,
+        *,
+        run_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> Sequence[Mapping[str, Any]]:
+        """Pointer index for CLI ls — rows with a Discord message/attachment id."""
+
+        conn = self._connection()
+        if run_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE channel_id=? AND run_id=?
+                  AND message_id IS NOT NULL AND message_id != ''
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (channel_id, run_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE channel_id=?
+                  AND message_id IS NOT NULL AND message_id != ''
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (channel_id, limit),
+            ).fetchall()
         out = []
         for row in rows:
             item = dict(row)
@@ -526,6 +615,69 @@ class SQLiteStore:
         """Return True if newly seen, False if duplicate. Compatibility helper."""
         return self.claim_inbound_message(message_id, channel_id)
 
+    # --- listen watermark (durable per-channel high-water) ---
+
+    def get_listen_watermark(self, channel_id: str) -> Optional[dict[str, Any]]:
+        row = self._connection().execute(
+            """
+            SELECT channel_id, last_created_ms, last_message_id
+            FROM listen_watermarks
+            WHERE channel_id=?
+            """,
+            (channel_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        raw_ms = row["last_created_ms"]
+        return {
+            "channel_id": str(row["channel_id"]),
+            "last_created_ms": int(raw_ms) if raw_ms is not None else None,
+            "last_message_id": str(row["last_message_id"] or ""),
+        }
+
+    def seed_listen_watermark(self, channel_id: str, created_ms: int) -> dict[str, Any]:
+        """Insert first-listen high-water if absent. Never overwrite a later mark."""
+
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO listen_watermarks (channel_id, last_created_ms, last_message_id)
+            VALUES (?, ?, '')
+            """,
+            (channel_id, created_ms),
+        )
+        conn.commit()
+        existing = self.get_listen_watermark(channel_id)
+        if existing is not None:
+            return existing
+        return {
+            "channel_id": channel_id,
+            "last_created_ms": created_ms,
+            "last_message_id": "",
+        }
+
+    def set_listen_watermark(
+        self,
+        channel_id: str,
+        *,
+        created_ms: Optional[int],
+        message_id: str = "",
+    ) -> None:
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO listen_watermarks (
+                channel_id, last_created_ms, last_message_id, updated_at
+            ) VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(channel_id) DO UPDATE SET
+                last_created_ms=excluded.last_created_ms,
+                last_message_id=excluded.last_message_id,
+                updated_at=datetime('now')
+            """,
+            (channel_id, created_ms, message_id),
+        )
+        conn.commit()
+
     # --- gateway ownership ---
 
     def claim_gateway(self, bot_token_fingerprint: str, owner_id: str) -> None:
@@ -541,11 +693,12 @@ class SQLiteStore:
                 (bot_token_fingerprint,),
             ).fetchone()
             if row is not None and row["owner_id"] != owner_id:
-                conn.rollback()
-                raise GatewayOwnershipError(
-                    f"token {bot_token_fingerprint} already owned by {row['owner_id']!r}; "
-                    f"refusing claim by {owner_id!r}"
-                )
+                if not _cli_owner_is_dead(str(row["owner_id"])):
+                    conn.rollback()
+                    raise GatewayOwnershipError(
+                        f"token {bot_token_fingerprint} already owned by {row['owner_id']!r}; "
+                        f"refusing claim by {owner_id!r}"
+                    )
             conn.execute(
                 """
                 INSERT INTO gateway_owners (bot_token_fingerprint, owner_id, claimed_at)
@@ -597,6 +750,32 @@ class SQLiteStore:
             (bot_token_fingerprint,),
         ).fetchone()
         return str(row["owner_id"]) if row else None
+
+
+def _cli_owner_is_dead(owner_id: str) -> bool:
+    """True when owner looks like discord-os-cli-<pid>-<hex> and pid is gone."""
+
+    prefix = ""
+    for candidate in (CLI_OWNER_PREFIX, LEGACY_CLI_OWNER_PREFIX):
+        if owner_id.startswith(candidate):
+            prefix = candidate
+            break
+    if not prefix:
+        return False
+    pid_text, sep, _ = owner_id[len(prefix) :].partition("-")
+    if not sep:
+        return False
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
 
 
 def _memory_row(row: sqlite3.Row) -> dict[str, Any]:

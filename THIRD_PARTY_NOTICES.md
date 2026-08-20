@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-This project is a **GitHub-first, open-source Discord-native agent bridge**. It does **not** copy source code from the upstream Discord MCP servers below. It talks to them as external processes or HTTP endpoints through a product-owned facade and thin provider adapters.
+**Discord OS** is a GitHub-first, open-source Discord harness. It does **not** copy source code from the upstream Discord MCP servers below. It talks to them as optional external processes or HTTP endpoints through a product-owned facade and thin provider adapters. Default I/O is official Discord REST.
 
 ## SaseQ / discord-mcp
 

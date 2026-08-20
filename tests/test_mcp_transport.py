@@ -194,3 +194,14 @@ def test_stdio_initialize_and_match_by_id(monkeypatch):
     result = client.call_tool("send_message", {"channel_id": "1", "content": "hi"})
     assert result.ok is True
     client.close()
+
+
+def test_parse_mcp_http_body_json_and_sse():
+    from agent_discord.discord.providers.base import parse_mcp_http_body
+
+    direct = parse_mcp_http_body('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+    assert direct["result"]["ok"] is True
+    sse = parse_mcp_http_body(
+        "id:sess-1\nevent:message\ndata:{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n"
+    )
+    assert sse["result"]["tools"] == []

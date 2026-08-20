@@ -12,20 +12,22 @@ from uuid import uuid4
 from agent_discord.contracts import DiscordMessage, ToolDescriptor, ToolInvocationResult
 from agent_discord.discord.errors import ToolInvocationError
 from agent_discord.discord.providers.base import MCPTransport, extract_text_content
-from agent_discord.discord.providers.saseq import _parse_messages
+from agent_discord.discord.providers.saseq import AttachmentMCPOperations, _parse_messages
 
 
-class BrainDAODiscordProvider:
+class BrainDAODiscordProvider(AttachmentMCPOperations):
     """Adapter for BrainDAO mcp-discord (@iqai) over HTTP or stdio."""
 
     name = "braindao"
+    _prefer_camel_case = False
 
     _SEND_CANDIDATES = ("send_message", "DISCORD_SEND_MESSAGE", "discord_send")
     _READ_CANDIDATES = ("read_messages", "DISCORD_READ_MESSAGES", "get_channel_messages")
     _THREAD_CANDIDATES = ("create_thread", "DISCORD_CREATE_THREAD", "start_thread")
 
-    def __init__(self, client: MCPTransport) -> None:
+    def __init__(self, client: MCPTransport, *, bot_token: str = "") -> None:
         self._client = client
+        self._bot_token = bot_token
         self._catalog: Optional[list[ToolDescriptor]] = None
         self._sampling_handlers: list[Any] = []
 

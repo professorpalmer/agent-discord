@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent_discord import PRODUCT_NAME
 from agent_discord.config import AppConfig, load_config
 from agent_discord.persistence.sqlite import SQLiteStore
 
@@ -24,13 +25,16 @@ def bootstrap_workspace(
     config.workspace.mkdir(parents=True, exist_ok=True)
     (config.workspace / "artifacts").mkdir(parents=True, exist_ok=True)
     (config.workspace / "logs").mkdir(parents=True, exist_ok=True)
+    (config.workspace / "keys").mkdir(parents=True, exist_ok=True)
+    (config.workspace / "stash").mkdir(parents=True, exist_ok=True)
 
     store = SQLiteStore(config.database_path)
     store.initialize()
     store.close()
 
     marker = {
-        "version": "0.1.0",
+        "product": PRODUCT_NAME,
+        "version": "0.3.0",
         "workspace": str(config.workspace),
         "database": str(config.database_path),
         "discord_mcp_provider": config.discord_mcp_provider,
