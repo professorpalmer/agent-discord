@@ -199,6 +199,10 @@ Developer Portal → Bot can set avatar and banner. If the bot has no avatar, `d
 
 ![HOST card stopped, recent-jobs menu, and a Done receipt in #marionette-dev](docs/screenshots/discord-host.png)
 
+0.4.0 next-level cards (token stream, code/diff fences, Approve/Cancel/Retry), generated from the live builders:
+
+![Thinking, Plan, code, and diff cards with job action rows](docs/screenshots/next-level-cards.png)
+
 The mark used when the bot has no avatar:
 
 ![Discord OS mark](docs/icon.png)
@@ -224,7 +228,7 @@ The adapter documents an expected session/job/events/status/cancel contract; it 
 ```text
 discord-os bootstrap [--workspace PATH]
 discord-os check [--allow-empty-token] [--live] [--channel-id ID]
-discord-os run TASK --channel-id ID [--message-id ID] [--fake] [--no-discord-post] [--json]
+discord-os run TASK --channel-id ID [--message-id ID] [--workers N] [--fake] [--no-discord-post] [--json]
 discord-os setup --channel-id ID
 discord-os host start --channel-id ID
 discord-os host stop
@@ -248,9 +252,9 @@ Also: `python -m agent_discord …`
 
 ```text
 CLI → Orchestrator → backend (Puppetmaster agentic | Puppetmaster cursor | optional Marionette HTTP | fake)
-                  ↘ SQLite (bindings, tasks, runs, events, memory, artifacts + object pointers,
-                            inbound message dedupe, gateway ownership,
-                            optional research claims / leases / negatives)
+                  ↘ SQLite (bindings, tasks, runs, events, memory, preferences,
+                            artifacts + object pointers, inbound message dedupe,
+                            gateway ownership, optional research claims / leases / negatives)
                   ↘ Discord facade → object store → REST (default) | optional SaseQ/BrainDAO | fake
 ```
 

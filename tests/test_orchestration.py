@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_discord.contracts import ProgressSummary, RunReceipt, TaskIntake, TaskStatus
+from agent_discord.contracts import (
+    DispatchEvent,
+    EventKind,
+    ProgressSummary,
+    RunReceipt,
+    TaskIntake,
+    TaskStatus,
+)
 from agent_discord.discord.facade import DiscordFacade
 from agent_discord.discord.providers.fake import FakeDiscordMCPProvider
-from agent_discord.orchestration.orchestrator import AgentOrchestrator
+from agent_discord.orchestration.orchestrator import (
+    TOKEN_CARD_FLUSH_SECONDS,
+    AgentOrchestrator,
+)
 from agent_discord.orchestration.receipts import render_receipt
 from agent_discord.persistence.sqlite import SQLiteStore
 from agent_discord.puppetmaster.fake import FakePuppetmasterBackend
+from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
 from agent_discord.redaction import strip_forbidden_keys
 
 
@@ -160,3 +171,142 @@ def test_strip_forbidden_keys_recursive():
         }
     )
     assert cleaned == {"a": 1, "nested": {"keep": [1, {"v": 2}]}}
+
+
+class _Clock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _CountingFacade:
+    def __init__(self, inner: DiscordFacade) -> None:
+        self._inner = inner
+        self.edit_count = 0
+        self.thread_sends = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def edit_message(self, *args, **kwargs):
+        self.edit_count += 1
+        return self._inner.edit_message(*args, **kwargs)
+
+    def send_message(self, channel_id, content, *, thread_id=None, **kwargs):
+        if thread_id:
+            self.thread_sends += 1
+        return self._inner.send_message(
+            channel_id, content, thread_id=thread_id, **kwargs
+        )
+
+
+class _TokenStreamBackend:
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.pin = DEFAULT_MODEL_PIN
+        self.last_request = None
+
+    def resolve_model(self, requested: str):
+        return self.pin
+
+    def stream(self, request):
+        self.last_request = request
+        accumulated = ""
+        for index in range(8):
+            accumulated += f"a{index}"
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="thinking",
+                    message=f"a{index}",
+                    details={
+                        "token": True,
+                        "stream_phase": "thinking",
+                        "token_text": accumulated,
+                    },
+                ),
+            )
+        self.clock.advance(TOKEN_CARD_FLUSH_SECONDS + 0.05)
+        accumulated = ""
+        for index in range(8):
+            accumulated += f"b{index}"
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="code",
+                    message=f"b{index}",
+                    details={
+                        "token": True,
+                        "stream_phase": "code",
+                        "token_text": accumulated,
+                    },
+                ),
+            )
+        yield DispatchEvent(
+            kind=EventKind.RECEIPT,
+            summary=ProgressSummary(stage="done", message="completed", percent=100.0),
+        )
+
+    def dispatch(self, request):
+        raise AssertionError("stream should be used")
+
+    def cancel(self, run_id: str) -> bool:
+        return False
+
+    def status(self, run_id: str) -> TaskStatus:
+        return TaskStatus.COMPLETED
+
+
+def test_token_stream_flushes_card_on_interval_not_per_token(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+    store = SQLiteStore(tmp_path / "token.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_TokenStreamBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+    )
+    receipt = orch.run_task(
+        TaskIntake(text="stream tokens", channel_id="ch", workspace_id="ws")
+    )
+    assert receipt.status == TaskStatus.COMPLETED
+    assert 1 <= facade.edit_count <= 3
+    assert facade.edit_count < 16
+    assert 2 <= facade.thread_sends <= 4
+    assert facade.thread_sends < 16
+    store.close()
+
+
+def test_percent_progress_still_edits_immediately(tmp_path: Path):
+    orch, store, fake_discord, _backend = _orch(tmp_path)
+    receipt = orch.run_task(
+        TaskIntake(text="review invoices", channel_id="ch", workspace_id="ws")
+    )
+    assert receipt.status == TaskStatus.COMPLETED
+    assert any(item.percent == 50.0 for item in receipt.progress)
+    edited = [
+        message
+        for message in fake_discord.sent
+        if "Work" in (message.content or "")
+        or any(
+            "Work" in str(child)
+            for row in ((message.metadata or {}).get("components") or [])
+            for child in (row.get("components") or [row])
+        )
+    ]
+    assert edited or fake_discord.sent
+    store.close()

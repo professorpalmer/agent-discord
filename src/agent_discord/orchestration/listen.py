@@ -141,6 +141,10 @@ def should_dispatch_inbound(message: DiscordMessage) -> bool:
     if is_harness_message(content, embeds, components):
         return False
     if not content:
+        if isinstance(meta, dict) and (
+            meta.get("transcript") or meta.get("voice_transcript")
+        ):
+            return True
         return False
     if is_harness_card(content):
         return False
@@ -257,7 +261,13 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
-        if not should_dispatch_inbound(message):
+        intake_text, intake_meta, skip_voice = _collab_intake(message, discord)
+        if skip_voice:
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
+        if not intake_text and not should_dispatch_inbound(message):
             watermark = _advance_listen_watermark(
                 store, channel_id, created_ms, message.message_id, watermark
             )
@@ -267,16 +277,23 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
+        text = intake_text or (message.content or "").strip()
+        if not text:
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
         receipts.append(
             orchestrator.run_task(
                 TaskIntake(
-                    text=message.content.strip(),
+                    text=text,
                     channel_id=channel_id,
                     workspace_id=workspace_id,
                     guild_id=guild_id,
                     thread_id=message.thread_id or thread_id,
                     message_id=message.message_id or None,
                     requester_id=message.author_id,
+                    metadata=intake_meta,
                 )
             )
         )
@@ -481,3 +498,50 @@ def publish_host_card(
             writer(channel_id, card_message_id=message_id)
         except Exception:
             pass
+
+
+def _collab_intake(message: DiscordMessage, discord: Any) -> tuple[str, dict[str, Any], bool]:
+    """Voice + thread-history context. Never downloads Discord CDN audio."""
+
+    meta: dict[str, Any] = {}
+    if isinstance(message.metadata, Mapping):
+        meta.update(dict(message.metadata))
+    mentioned = "@" in (message.content or "")
+    meta["mentioned"] = mentioned
+    history: list[str] = []
+    thread_id = message.thread_id
+    if thread_id:
+        reader = getattr(discord, "read_messages", None)
+        if callable(reader):
+            try:
+                recent = reader(message.channel_id, limit=8, thread_id=thread_id)
+                history = [
+                    str(getattr(item, "content", "") or "").strip()
+                    for item in list(recent or [])
+                    if str(getattr(item, "content", "") or "").strip()
+                ][-6:]
+            except Exception:
+                history = []
+    if history:
+        meta["thread_history"] = history
+        meta["reading"] = f"thread {thread_id}"
+    try:
+        from agent_discord.discord.voice import detect_voice_intent, spoken_command_to_intake
+    except Exception:
+        return "", meta, False
+    try:
+        intent = detect_voice_intent(message)
+    except Exception:
+        return "", meta, False
+    if not intent:
+        return "", meta, False
+    if intent.get("kind") == "voice_attachment" and not (
+        meta.get("transcript") or meta.get("voice_transcript")
+    ):
+        return "", meta, True
+    transcript = str(intent.get("intake") or intent.get("transcript") or "")
+    if not transcript and (meta.get("transcript") or meta.get("voice_transcript")):
+        transcript = spoken_command_to_intake(
+            str(meta.get("transcript") or meta.get("voice_transcript") or "")
+        )
+    return transcript.strip(), meta, False

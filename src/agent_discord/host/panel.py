@@ -270,8 +270,37 @@ def handle_gateway_interaction(
     opener: Any = None,
     on_ask: Optional[Callable[[str], None]] = None,
     on_power: Optional[Callable[[bool], None]] = None,
+    on_job: Optional[Callable[[str, str], None]] = None,
 ) -> Optional[str]:
     """ACK within Discord's 3s window, then paint the panel. Best-effort."""
+
+    from agent_discord.host.actions import job_action_from_custom_id
+
+    data = payload.get("data")
+    custom_id = ""
+    if isinstance(data, dict):
+        custom_id = str(data.get("custom_id") or "")
+    job = job_action_from_custom_id(custom_id)
+    if job is not None:
+        interaction_id, ix_token = interaction_ids(payload)
+        if interaction_id and ix_token:
+            try:
+                from agent_discord.discord.rest import callback_interaction
+
+                callback_interaction(
+                    interaction_id=interaction_id,
+                    interaction_token=ix_token,
+                    payload={"type": CALLBACK_DEFERRED_UPDATE},
+                    opener=opener,
+                )
+            except Exception:
+                pass
+        if callable(on_job):
+            try:
+                on_job(job.action, job.run_id)
+            except Exception:
+                pass
+        return job.action
 
     if int(payload.get("type") or 0) == INTERACTION_MODAL_SUBMIT:
         text = ask_text_from_interaction(payload)

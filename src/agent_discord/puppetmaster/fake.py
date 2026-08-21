@@ -27,7 +27,9 @@ class FakePuppetmasterBackend:
     runs: dict[str, TaskStatus] = field(default_factory=dict)
     cancelled: set[str] = field(default_factory=set)
     fail_next: bool = False
+    rate_limit_next: bool = False
     last_request: Optional[DispatchRequest] = None
+    last_requests: list[DispatchRequest] = field(default_factory=list)
     dispatch_count: int = 0
     artifact_files: list[str] = field(default_factory=list)
 
@@ -43,6 +45,7 @@ class FakePuppetmasterBackend:
 
     def dispatch(self, request: DispatchRequest) -> DispatchResult:
         self.last_request = request
+        self.last_requests.append(request)
         self.dispatch_count += 1
         pin = self.resolve_model(request.model)
         self.runs[request.run_id] = TaskStatus.RUNNING
@@ -61,6 +64,21 @@ class FakePuppetmasterBackend:
                 ),
                 final_summary="cancelled",
                 error="cancelled",
+            )
+        if self.rate_limit_next:
+            self.rate_limit_next = False
+            self.runs[request.run_id] = TaskStatus.FAILED
+            return DispatchResult(
+                run_id=request.run_id,
+                status=TaskStatus.FAILED,
+                events=(
+                    DispatchEvent(
+                        kind=EventKind.ERROR,
+                        summary=ProgressSummary(stage="error", message="429 rate limited"),
+                    ),
+                ),
+                final_summary="rate limited",
+                error="429 rate limited",
             )
         if self.fail_next:
             self.fail_next = False

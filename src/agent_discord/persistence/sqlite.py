@@ -120,7 +120,21 @@ CREATE TABLE IF NOT EXISTS host_control (
     card_message_id TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS preferences (
+    workspace_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(workspace_id, key)
+);
 """
+
+PREFERENCE_KINDS = frozenset({"preference", "style", "failure"})
+_PROMPT_MEMORY_PER_KIND = 8
+_PROMPT_MEMORY_VALUE_CHARS = 160
+_PROMPT_MEMORY_BLOCK_CHARS = 1500
 
 
 class SQLiteStore:
@@ -136,6 +150,7 @@ class SQLiteStore:
         conn.executescript(RESEARCH_SCHEMA)
         self._migrate_seen_messages(conn)
         self._migrate_artifacts(conn)
+        self._migrate_preferences(conn)
         self._fts_enabled = self._try_enable_fts(conn)
         conn.commit()
 
@@ -177,6 +192,39 @@ class SQLiteStore:
         ):
             if name not in cols:
                 conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {decl}")
+
+    def _migrate_preferences(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS preferences (
+                workspace_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(workspace_id, key)
+            )
+            """
+        )
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(preferences)").fetchall()
+        }
+        for name, decl in (
+            ("workspace_id", "TEXT"),
+            ("key", "TEXT"),
+            ("value", "TEXT"),
+            ("kind", "TEXT"),
+            ("updated_at", "TEXT"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE preferences ADD COLUMN {name} {decl}")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_workspace_key
+            ON preferences(workspace_id, key)
+            """
+        )
 
     def _try_enable_fts(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -500,6 +548,125 @@ class SQLiteStore:
             (workspace_id, channel_id, like, limit),
         ).fetchall()
         return [_memory_row(r) for r in rows]
+
+    # --- preferences / style / failure memory ---
+
+    def set_preference(
+        self,
+        workspace_id: str,
+        key: str,
+        value: str,
+        kind: str = "preference",
+    ) -> None:
+        workspace_id = str(workspace_id or "").strip()
+        key = str(key or "").strip()
+        if not workspace_id:
+            raise ValueError("workspace_id is required")
+        if not key:
+            raise ValueError("key is required")
+        kind_value = str(kind or "preference").strip()
+        if kind_value not in PREFERENCE_KINDS:
+            allowed = ", ".join(sorted(PREFERENCE_KINDS))
+            raise ValueError(f"kind must be one of {allowed}; got {kind_value!r}")
+        safe_value = redact_text_markers(str(value or ""))
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO preferences (workspace_id, key, value, kind, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(workspace_id, key) DO UPDATE SET
+                value=excluded.value,
+                kind=excluded.kind,
+                updated_at=datetime('now')
+            """,
+            (workspace_id, key, safe_value, kind_value),
+        )
+        conn.commit()
+
+    def get_preference(self, workspace_id: str, key: str) -> Optional[str]:
+        row = self._connection().execute(
+            "SELECT value FROM preferences WHERE workspace_id=? AND key=?",
+            (workspace_id, key),
+        ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def list_preferences(
+        self,
+        workspace_id: str,
+        kind: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        conn = self._connection()
+        if kind is None:
+            rows = conn.execute(
+                """
+                SELECT workspace_id, key, value, kind, updated_at
+                FROM preferences
+                WHERE workspace_id=?
+                ORDER BY kind ASC, updated_at DESC
+                """,
+                (workspace_id,),
+            ).fetchall()
+        else:
+            kind_value = str(kind).strip()
+            if kind_value not in PREFERENCE_KINDS:
+                allowed = ", ".join(sorted(PREFERENCE_KINDS))
+                raise ValueError(f"kind must be one of {allowed}; got {kind_value!r}")
+            rows = conn.execute(
+                """
+                SELECT workspace_id, key, value, kind, updated_at
+                FROM preferences
+                WHERE workspace_id=? AND kind=?
+                ORDER BY updated_at DESC
+                """,
+                (workspace_id, kind_value),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_failure(self, workspace_id: str, key: str, reason: str) -> None:
+        self.set_preference(workspace_id, key, reason, kind="failure")
+
+    def list_failures(
+        self, workspace_id: str, limit: int = 8
+    ) -> list[dict[str, Any]]:
+        capped = max(1, min(int(limit), 25))
+        rows = self._connection().execute(
+            """
+            SELECT workspace_id, key, value, kind, updated_at
+            FROM preferences
+            WHERE workspace_id=? AND kind='failure'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (workspace_id, capped),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prompt_memory_block(self, workspace_id: str) -> str:
+        lines: list[str] = []
+        for kind, heading in (
+            ("preference", "[preferences]"),
+            ("style", "[style]"),
+            ("failure", "[failures]"),
+        ):
+            rows = self.list_preferences(workspace_id, kind=kind)[:_PROMPT_MEMORY_PER_KIND]
+            if not rows:
+                continue
+            lines.append(heading)
+            for row in rows:
+                key = str(row.get("key") or "")
+                value = redact_text_markers(str(row.get("value") or ""))
+                if len(value) > _PROMPT_MEMORY_VALUE_CHARS:
+                    value = value[: _PROMPT_MEMORY_VALUE_CHARS - 3] + "..."
+                if kind == "failure":
+                    lines.append(f"{key}: {value}")
+                else:
+                    lines.append(f"{key}={value}")
+        if not lines:
+            return ""
+        block = redact_text_markers("\n".join(lines))
+        if len(block) > _PROMPT_MEMORY_BLOCK_CHARS:
+            return block[: _PROMPT_MEMORY_BLOCK_CHARS - 3] + "..."
+        return block
 
     # --- artifacts ---
 
