@@ -39,7 +39,7 @@ def bootstrap_workspace(
 
     marker = {
         "product": PRODUCT_NAME,
-        "version": "0.3.1",
+        "version": "0.3.2",
         "workspace": str(config.workspace),
         "database": str(config.database_path),
         "discord_mcp_provider": config.discord_mcp_provider,
