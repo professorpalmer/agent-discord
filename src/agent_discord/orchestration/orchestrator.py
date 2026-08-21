@@ -10,7 +10,6 @@ from agent_discord.contracts import (
     ArtifactRef,
     ContextSnapshot,
     DispatchRequest,
-    DispatchResult,
     EventKind,
     ProgressSummary,
     RunReceipt,
