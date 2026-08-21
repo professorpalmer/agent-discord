@@ -53,7 +53,7 @@ def test_preferences_inject_into_dispatch(tmp_path: Path):
     block = "\n".join(contents)
     assert "tone=concise" in block
     assert "formatter=black" in block
-    assert "429 timeout" in block
+    assert "429 timeout" not in block
     store.close()
 
 

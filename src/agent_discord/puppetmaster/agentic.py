@@ -27,6 +27,7 @@ from agent_discord.puppetmaster.backend import (
     cli_supports_flag,
     iter_cli_process_events,
     prepend_early_job_id,
+    request_workdir,
 )
 from agent_discord.puppetmaster.models import AGENTIC_MODEL_PIN
 
@@ -100,7 +101,7 @@ class AgenticPuppetmasterBackend:
             )
 
         prompt = _safe_dispatch_prompt(request)
-        workdir = str(self.cwd) if self.cwd else None
+        workdir = request_workdir(request, self.cwd)
         mode = str((request.metadata or {}).get("compute_mode") or "implement")
         if mode not in {"implement", "analyze"}:
             mode = "implement"
@@ -241,7 +242,7 @@ class AgenticPuppetmasterBackend:
             return
 
         prompt = _safe_dispatch_prompt(request)
-        workdir = str(self.cwd) if self.cwd else None
+        workdir = request_workdir(request, self.cwd)
         mode = str((request.metadata or {}).get("compute_mode") or "implement")
         if mode not in {"implement", "analyze"}:
             mode = "implement"

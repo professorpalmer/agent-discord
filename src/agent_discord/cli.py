@@ -175,6 +175,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--fake", action="store_true", help="Use local workspace only (no network)")
     p_ls.add_argument("--json", action="store_true", help="Print pointer JSON (no url key)")
 
+    p_wiki = sub.add_parser(
+        "wiki",
+        help="Query the portable LLM wiki over HTTP (same results as wiki MCP)",
+    )
+    wiki_sub = p_wiki.add_subparsers(dest="wiki_command", required=True)
+    p_wiki_query = wiki_sub.add_parser("query", help="Natural-language wiki question")
+    p_wiki_query.add_argument("question")
+    p_wiki_query.add_argument("--json", action="store_true")
+    p_wiki_search = wiki_sub.add_parser("search", help="Keyword search")
+    p_wiki_search.add_argument("query")
+    p_wiki_search.add_argument("--limit", type=int, default=10)
+    p_wiki_search.add_argument("--json", action="store_true")
+
+    p_recall = sub.add_parser("recall", help="Read think-tank Discord channels")
+    p_recall.add_argument("query", nargs="?", default="")
+    p_recall.add_argument("--workspace-id", default="default")
+    p_recall.add_argument("--fake", action="store_true")
+    p_recall.add_argument("--json", action="store_true")
+
+    p_note = sub.add_parser("note", help="Write a note into a think-tank channel")
+    p_note.add_argument("text")
+    p_note.add_argument("--channel-id", default=None)
+    p_note.add_argument("--workspace-id", default="default")
+    p_note.add_argument("--fake", action="store_true")
+    p_note.add_argument("--json", action="store_true")
+
     p_setup = sub.add_parser(
         "setup",
         help="One-time: invite, login helper, and On/Off panel in Discord",
@@ -406,6 +432,34 @@ def cmd_check(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             file=out,
         )
     print(f"pm cwd:     {config.puppetmaster_cwd}", file=out)
+    from agent_discord.host.realms import parse_channel_realms
+    from agent_discord.host.repos import load_host_repos
+
+    repos = load_host_repos()
+    if repos:
+        print("repos:", file=out)
+        for repo in repos:
+            print(f"  {repo.name}: {repo.path}", file=out)
+    realms = parse_channel_realms(os.environ.get("DISCORD_OS_CHANNELS") or "", repos)
+    if realms:
+        print("realms:", file=out)
+        for realm in realms:
+            print(f"  {realm.name}: {realm.channel_id}", file=out)
+    from agent_discord.host.tools import load_host_tools
+    from agent_discord.host.wiki import wiki_base_url
+
+    tools = load_host_tools()
+    ready_tools = [item for item in tools if item.ready]
+    if ready_tools:
+        print("tools:", file=out)
+        for tool in ready_tools:
+            print(f"  {tool.name}: {tool.kind} {tool.hint or tool.bin or tool.url}", file=out)
+    wiki_url = wiki_base_url()
+    if wiki_url:
+        print(f"wiki:      {wiki_url}", file=out)
+    memory_ids = os.environ.get("DISCORD_OS_MEMORY") or ""
+    if memory_ids.strip():
+        print(f"memory:    {memory_ids}", file=out)
     if config.agent_backend == "marionette":
         print(f"marionette: {config.marionette_base_url or '(unset)'}", file=out)
     print(f"bootstrapped: {info.get('bootstrapped', False)}", file=out)
@@ -590,6 +644,7 @@ def cmd_run(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             research=research,
             max_object_bytes=config.discord_max_object_bytes,
             workspace=config.workspace,
+            compute_cwd=config.puppetmaster_cwd,
         )
         intake = TaskIntake(
             text=args.task,
@@ -898,6 +953,90 @@ def cmd_ls(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     return 0
 
 
+def cmd_wiki(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.host.wiki import wiki_query, wiki_search
+
+    if args.wiki_command == "search":
+        payload = wiki_search(args.query, limit=int(getattr(args, "limit", 10) or 10))
+    else:
+        payload = wiki_query(args.question)
+    if args.json:
+        print(json.dumps(payload, indent=2), file=out)
+    elif payload.get("error"):
+        print(f"wiki: {payload.get('error')}", file=sys.stderr)
+        detail = str(payload.get("detail") or "").strip()
+        if detail:
+            print(detail, file=sys.stderr)
+        return 1
+    elif args.wiki_command == "search":
+        for row in payload.get("results") or []:
+            if isinstance(row, dict):
+                print(f"{row.get('slug') or '?'}  {row.get('title') or ''}", file=out)
+    else:
+        print(str(payload.get("answer") or "").strip() or json.dumps(payload), file=out)
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.host.memory import recall_think_tank
+
+    config = load_config()
+    with _object_runtime(config, fake=args.fake) as (store, discord):
+        text = recall_think_tank(
+            discord,
+            store,
+            args.query or "",
+            workspace_id=args.workspace_id,
+        )
+    if args.json:
+        print(json.dumps({"text": text}, indent=2), file=out)
+    elif text:
+        print(text, file=out)
+    else:
+        print("recall: no think-tank channels or matching notes", file=out)
+    return 0
+
+
+def cmd_note(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.host.memory import memory_channel_ids, post_think_tank_note
+
+    config = load_config()
+    with _object_runtime(config, fake=args.fake) as (store, discord):
+        channel_id = (args.channel_id or "").strip()
+        if not channel_id:
+            banks = memory_channel_ids(store, workspace_id=args.workspace_id)
+            channel_id = banks[0] if banks else ""
+        if not channel_id:
+            print("note: pass --channel-id or bind a memory channel first", file=sys.stderr)
+            return 1
+        posted = post_think_tank_note(discord, channel_id, args.text)
+        if posted is None:
+            print("note: failed to post", file=sys.stderr)
+            return 1
+        message_id = getattr(posted, "message_id", "") or ""
+        store.remember(
+            workspace_id=args.workspace_id,
+            channel_id=channel_id,
+            content=args.text[:500],
+            source="think-tank",
+            provenance={"cli": True},
+        )
+        if args.json:
+            print(
+                json.dumps(
+                    {"channel_id": channel_id, "message_id": message_id},
+                    indent=2,
+                ),
+                file=out,
+            )
+        else:
+            print(f"note {channel_id}/{message_id}", file=out)
+    return 0
+
+
 def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     out = out or sys.stdout
     config = apply_runtime_secrets(load_config())
@@ -935,14 +1074,35 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         research=ResearchMemoryStore(store),
         max_object_bytes=config.discord_max_object_bytes,
         workspace=config.workspace,
+        compute_cwd=config.puppetmaster_cwd,
         retry_backoff_s=15.0,
     )
     claimed = False
     exit_code = 0
     panel_stop = threading.Event()
     discord_down = threading.Event()
-    asks: Queue[str] = Queue()
+    asks: Queue[tuple[str, str]] = Queue()
     ignore_history_before_ms = int(time.time() * 1000) - LISTEN_HISTORY_SLACK_MS
+    from agent_discord.host.memory import seed_memory_channels
+    from agent_discord.host.realms import listen_channel_ids, seed_channel_realms
+    from agent_discord.host.repos import load_host_repos
+    from agent_discord.orchestration.jobs import JobPool, realm_write_key
+
+    host_repos = load_host_repos()
+    orch.host_repos = host_repos
+    seed_channel_realms(
+        store,
+        workspace_id=args.workspace_id,
+        repos=host_repos,
+    )
+    seed_memory_channels(store, workspace_id=args.workspace_id)
+    listen_ids = listen_channel_ids(
+        args.channel_id,
+        store,
+        workspace_id=args.workspace_id,
+        repos=host_repos,
+    )
+    job_pool = JobPool()
     try:
         # Local process lock. Message intake stays REST. Host run opens a
         # Discord Gateway only so On/Off buttons work (no public URL).
@@ -957,12 +1117,14 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             )
             store.set_host_control(args.channel_id, default_armed=False)
             if not args.no_discord_post:
-                publish_host_card(
-                    discord,
-                    store,
-                    args.channel_id,
-                    thread_id=args.thread_id,
-                )
+                for listen_id in listen_ids:
+                    store.set_host_control(listen_id, default_armed=False)
+                    publish_host_card(
+                        discord,
+                        store,
+                        listen_id,
+                        thread_id=args.thread_id if listen_id == args.channel_id else None,
+                    )
             if (
                 not args.fake
                 and config.discord_bot_token
@@ -977,7 +1139,8 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                     asks=asks,
                     orch=orch,
                     host_roots=(
-                        (config.puppetmaster_cwd, config.workspace)
+                        tuple(repo.path for repo in host_repos)
+                        + (config.puppetmaster_cwd, config.workspace)
                         if config.host_actions
                         else ()
                     ),
@@ -986,46 +1149,60 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             if discord_down.is_set():
                 exit_code = 1
                 break
-            receipts = list(
-                drain_inbound(
-                    orch,
-                    discord,
-                    channel_id=args.channel_id,
-                    workspace_id=args.workspace_id,
-                    guild_id=args.guild_id,
-                    thread_id=args.thread_id,
-                    limit=args.limit,
-                    workspace=config.workspace,
-                    since_ms=ignore_history_before_ms,
-                    host_roots=(
-                        (config.puppetmaster_cwd, config.workspace)
-                        if config.host_actions
-                        else ()
-                    ),
-                )
+            listen_ids = listen_channel_ids(
+                args.channel_id,
+                store,
+                workspace_id=args.workspace_id,
+                repos=host_repos,
             )
+            receipts: list[Any] = []
+            for listen_id in listen_ids:
+                receipts.extend(
+                    drain_inbound(
+                        orch,
+                        discord,
+                        channel_id=listen_id,
+                        workspace_id=args.workspace_id,
+                        guild_id=args.guild_id,
+                        thread_id=args.thread_id if listen_id == args.channel_id else None,
+                        limit=args.limit,
+                        workspace=config.workspace,
+                        since_ms=ignore_history_before_ms,
+                        host_roots=(
+                            tuple(repo.path for repo in host_repos)
+                            + (config.puppetmaster_cwd, config.workspace)
+                            if config.host_actions
+                            else ()
+                        ),
+                        job_pool=job_pool,
+                    )
+                )
             while True:
                 try:
-                    prompt = asks.get_nowait()
+                    ask_channel, prompt = asks.get_nowait()
                 except Empty:
                     break
-                if not store.host_is_armed(args.channel_id):
+                if not store.host_is_armed(ask_channel or args.channel_id):
                     continue
                 from agent_discord.orchestration.service import is_spend_halted
 
                 if is_spend_halted(store, args.workspace_id):
                     continue
-                receipts.append(
-                    orch.run_task(
-                        TaskIntake(
-                            text=prompt,
-                            channel_id=args.channel_id,
-                            workspace_id=args.workspace_id,
-                            guild_id=args.guild_id,
-                            thread_id=args.thread_id,
-                        )
-                    )
+                ask_intake = TaskIntake(
+                    text=prompt,
+                    channel_id=ask_channel or args.channel_id,
+                    workspace_id=args.workspace_id,
+                    guild_id=args.guild_id,
+                    thread_id=args.thread_id if ask_channel == args.channel_id else None,
                 )
+                job_pool.submit(
+                    orch.run_task,
+                    ask_intake,
+                    write_key=realm_write_key(ask_intake),
+                )
+            receipts.extend(job_pool.reap())
+            if args.once:
+                receipts.extend(job_pool.wait())
             if args.json:
                 print(
                     json.dumps(
@@ -1077,7 +1254,7 @@ def _start_panel_gateway(
     channel_id: str,
     stop: threading.Event,
     discord_down: threading.Event,
-    asks: Optional[Queue[str]] = None,
+    asks: Optional[Queue[tuple[str, str]]] = None,
     orch: Any = None,
     host_roots: tuple[Any, ...] = (),
 ) -> None:
@@ -1094,7 +1271,7 @@ def _start_panel_gateway(
 
     def on_ask(text: str) -> None:
         if asks is not None and text.strip():
-            asks.put(text.strip())
+            asks.put((channel_id, text.strip()))
 
     def on_connected(sender: Any) -> None:
         presence.clear()
@@ -1114,6 +1291,14 @@ def _start_panel_gateway(
         if isinstance(data, dict):
             custom_id = str(data.get("custom_id") or "")
         print(f"panel click {custom_id}", flush=True)
+        from agent_discord.host.panel import interaction_channel_id
+
+        ask_channel = interaction_channel_id(payload, channel_id)
+
+        def on_ask_here(text: str) -> None:
+            if asks is not None and text.strip():
+                asks.put((ask_channel, text.strip()))
+
         def on_job(action: str, run_id: str) -> None:
             if orch is not None:
                 try:
@@ -1123,10 +1308,10 @@ def _start_panel_gateway(
                 if action == "retry" and asks is not None:
                     text = str((result or {}).get("intake_text") or "")
                     if text:
-                        asks.put(text)
+                        asks.put((ask_channel, text))
                 return
             if action == "retry" and asks is not None:
-                asks.put(f"retry run {run_id}")
+                asks.put((ask_channel, f"retry run {run_id}"))
                 return
             if action != "cancel":
                 return
@@ -1142,7 +1327,7 @@ def _start_panel_gateway(
             channel_id,
             payload,
             token=token,
-            on_ask=on_ask,
+            on_ask=on_ask_here,
             on_power=set_presence,
             on_job=on_job,
             host_roots=list(host_roots),
@@ -1623,6 +1808,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_get(args)
     if args.command == "ls":
         return cmd_ls(args)
+    if args.command == "wiki":
+        return cmd_wiki(args)
+    if args.command == "recall":
+        return cmd_recall(args)
+    if args.command == "note":
+        return cmd_note(args)
     if args.command == "host":
         return cmd_host(args)
     if args.command == "listen":

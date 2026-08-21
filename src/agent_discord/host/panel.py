@@ -447,6 +447,16 @@ def interaction_ids(payload: Mapping[str, Any]) -> tuple[str, str]:
     return str(payload.get("id") or ""), str(payload.get("token") or "")
 
 
+def interaction_channel_id(payload: Mapping[str, Any], fallback: str = "") -> str:
+    raw = payload.get("channel_id")
+    if raw:
+        return str(raw)
+    channel = payload.get("channel")
+    if isinstance(channel, dict) and channel.get("id"):
+        return str(channel["id"])
+    return str(fallback or "")
+
+
 def interaction_user_id(payload: Mapping[str, Any]) -> str:
     member = payload.get("member")
     if isinstance(member, dict):
@@ -489,6 +499,7 @@ def handle_gateway_interaction(
 
     from agent_discord.host.actions import job_action_from_custom_id
 
+    channel_id = interaction_channel_id(payload, channel_id)
     data = payload.get("data")
     custom_id = ""
     if isinstance(data, dict):

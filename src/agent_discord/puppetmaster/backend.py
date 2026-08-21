@@ -55,6 +55,19 @@ _SUMMARY_SKIP_PREFIXES = (
     "write the answer",
     "do not repeat",
     "internal:",
+    "task:",
+    "[failures]",
+    "[preferences]",
+    "[style]",
+    "[swarm.",
+    "decision:",
+    "finding:",
+    "gist:",
+    "verification:",
+    "confidence=",
+    "outcome:",
+    "full report:",
+    "host reach",
 )
 
 
@@ -175,7 +188,7 @@ class PuppetmasterCliBackend:
             "--timeout-seconds",
             str(int(self.timeout_seconds)),
         ]
-        workdir = str(self.cwd) if self.cwd else None
+        workdir = request_workdir(request, self.cwd)
         if workdir:
             command.extend(["--cwd", workdir])
         command.append(prompt)
@@ -301,7 +314,7 @@ class PuppetmasterCliBackend:
                 str(int(self.timeout_seconds)),
             ]
         )
-        workdir = str(self.cwd) if self.cwd else None
+        workdir = request_workdir(request, self.cwd)
         if workdir:
             command.extend(["--cwd", workdir])
         if cli_supports_flag(self.cli, "cursor", "--json-lines"):
@@ -370,6 +383,12 @@ def _safe_dispatch_prompt(request: DispatchRequest) -> str:
     channel = request.metadata.get("channel_id") if request.metadata else None
     if channel:
         lines.append(f"channel_id={channel}")
+    reach = ""
+    if request.metadata:
+        reach = str(request.metadata.get("host_reach") or "").strip()
+    if reach:
+        lines.append("")
+        lines.append(reach)
     if memory_bits:
         lines.append("")
         lines.append("Context memories:")
@@ -413,6 +432,21 @@ def prepend_early_job_id(command: list[str]) -> list[str]:
     return [command[0], "--emit-job-id-early", *command[1:]]
 
 
+def request_workdir(
+    request: DispatchRequest,
+    fallback: Optional[str | Path] = None,
+) -> Optional[str]:
+    """Honor a per-run checkout from metadata, else the backend default."""
+
+    meta = request.metadata or {}
+    raw = str(meta.get("cwd") or "").strip()
+    if raw:
+        return str(Path(raw).expanduser())
+    if fallback:
+        return str(Path(fallback))
+    return None
+
+
 def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
     """Keep human dialogue. Drop prompt echoes and CLI metadata."""
 
@@ -434,6 +468,10 @@ def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
 
 def _is_skipped_worker_line(raw: str) -> bool:
     lower = (raw or "").strip().lower()
+    if not lower:
+        return True
+    if "usage: puppetmaster" in lower:
+        return True
     return any(lower.startswith(prefix) for prefix in _SUMMARY_SKIP_PREFIXES)
 
 
@@ -621,6 +659,8 @@ def _normalize_token_event_type(parsed: Mapping[str, Any]) -> str:
     kind = str(parsed.get("kind") or "").strip().lower()
     if kind in {"text", "token", "delta"}:
         return "delta"
+    if kind in _TOKEN_EVENT_TYPES:
+        return kind
     if not event_type and parsed.get("text"):
         return "delta"
     return event_type
@@ -731,6 +771,9 @@ def _event_from_cli_line(
     token_event = _parse_token_line(line, model, buffer=buffer)
     if token_event is not None:
         return token_event
+    raw = (line or "").strip()
+    if not raw or _is_skipped_worker_line(raw):
+        return None
     progress = _parse_progress_line(line, model)
     if progress is not None and progress.summary.stage:
         stage = _PHASE_ALIASES.get(
@@ -921,7 +964,7 @@ def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
 
     parsed = _try_parse_json(raw)
     if isinstance(parsed, dict):
-        event_type = str(parsed.get("type") or "").strip().lower()
+        event_type = str(parsed.get("type") or parsed.get("kind") or "").strip().lower()
         if event_type in _TOKEN_EVENT_TYPES:
             return None
         cleaned = strip_forbidden_keys(parsed)
@@ -933,20 +976,25 @@ def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
                     pass
             if "stage" in cleaned:
                 stage = str(cleaned["stage"])
-            if "message" in cleaned:
-                message = str(cleaned["message"])[:500]
-            elif "summary" in cleaned:
-                message = str(cleaned["summary"])[:500]
+            human = ""
+            if cleaned.get("message"):
+                human = str(cleaned["message"])
+            elif cleaned.get("summary"):
+                human = str(cleaned["summary"])
+            spoken = usable_worker_text(human)
+            if not spoken:
+                return None
             details = {k: v for k, v in cleaned.items() if k in ALLOWED_REASONING_KEYS}
             return DispatchEvent(
                 kind=EventKind.PROGRESS,
                 summary=ProgressSummary(
                     stage=stage,
-                    message=redact_text_markers(message),
+                    message=redact_text_markers(spoken)[:500],
                     percent=percent,
                     details=details,
                 ),
             )
+        return None
 
     if percent is None and not any(word in lower for word in ("plan", "step", "tool", "finding", "reasoning", "working", "running")):
         return None

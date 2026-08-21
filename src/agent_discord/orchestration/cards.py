@@ -433,6 +433,8 @@ def host_card(
     role_count: int = 0,
     last_job: str = "",
     write_gate: bool = False,
+    realm: str = "",
+    bank: bool = False,
 ) -> CardMessage:
     _ = channel_id
     spend_line = _host_spend_line(spend_usd, cap_usd, halted)
@@ -449,9 +451,12 @@ def host_card(
             avatar_url=avatar_url,
             fields=fields,
         )
+    realm_line = _host_realm_line(realm)
+    bank_line = _host_bank_line(bank)
     if armed:
         body = (
-            f"{acl_line}\n{_host_write_line(write_gate)}\n"
+            f"{acl_line}\n{_host_write_line(write_gate)}"
+            f"{realm_line}{bank_line}\n"
             "Press Ask, Files, Terminal, or Browser. Off needs a confirm."
         )
         if spend_line:
@@ -466,7 +471,10 @@ def host_card(
             avatar_url=avatar_url,
             fields=fields,
         )
-    stopped = f"{acl_line}\n{_host_write_line(write_gate)}\nPress On to start."
+    stopped = (
+        f"{acl_line}\n{_host_write_line(write_gate)}"
+        f"{realm_line}{bank_line}\nPress On to start."
+    )
     if spend_line:
         stopped = f"{stopped}\n{spend_line}"
     if last_job:
@@ -497,6 +505,31 @@ def _host_write_line(write_gate: bool) -> str:
     if write_gate:
         return "Writes: Gate. Press Auto to skip Approve."
     return "Writes: Auto. Press Gate to require Approve."
+
+
+def _host_realm_line(realm: str) -> str:
+    name = (realm or "").strip()
+    if not name:
+        return ""
+    return f"\nRealm: {name}."
+
+
+def _host_bank_line(bank: bool) -> str:
+    if not bank:
+        return ""
+    return "\nBank: this channel is think-tank memory."
+
+
+def note_card(text: str, *, source_channel: str = "") -> CardMessage:
+    body = (text or "").strip()
+    if source_channel:
+        body = f"From #{source_channel}\n{body}"
+    return CardMessage(
+        kind="NOTE",
+        title="Note",
+        description=body or "Empty note.",
+        color=COLOR_IDLE,
+    )
 
 
 def _host_spend_line(

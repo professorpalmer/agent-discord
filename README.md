@@ -66,10 +66,14 @@ DISCORD_OS_SPEND_CAP_USD=10
 | **Off** then **Confirm** | Stops work. Cancel keeps it running. The helper stays so On still works from your phone. |
 | Recent jobs | String select on the HOST card. Pick a run to see its receipt. |
 | `schedule every 1h: run tests` | One SQLite cron row. The listen loop fires it. |
+| `bind puppetmaster` | This channel is that checkout. Bounce `#dugout` / `#marionette` the same way. |
+| `bind memory` | This channel is think-tank. Finished jobs leave a short note there. |
 | a voice memo | Transcribed with a local whisper CLI if one is on PATH. |
-| a normal sentence | A task, only while On, and only from a paired operator. |
+| a normal sentence | A task, only while On, and only from a paired operator. Two channels cook at once. |
 
 If Discord logs the bot out, work stops. The login helper starts again idle.
+
+Channel realms and think-tank rooms can also be set in `.env`: `DISCORD_OS_CHANNELS=puppetmaster:ID,dugout:ID` and `DISCORD_OS_MEMORY=ID`. Host tools are CLI or HTTP (`discord-os wiki query "…"`), not an MCP bus inside Discord.
 
 No Docker. No slash commands. No public URL. No `/on` to remember.
 

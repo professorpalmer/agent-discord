@@ -137,6 +137,22 @@ def test_prose_cli_line_becomes_token_stream():
     assert event.summary.details["token"] is True
     assert "Open PRs: none." in str(event.summary.details["token_text"])
     assert _event_from_cli_line("task_id=abc", "openrouter/auto", buffer) is None
+    assert (
+        _event_from_cli_line(
+            '{"ts": 1, "worker_id": "worker-1", "kind": "reasoning", "text": "\\n"}',
+            "openrouter/auto",
+            buffer,
+        )
+        is None
+    )
+    assert (
+        _event_from_cli_line(
+            "puppetmaster: mode=edit — workers may modify files in the working tree.",
+            "openrouter/auto",
+            buffer,
+        )
+        is None
+    )
 
 
 def test_dispatch_uses_cursor_subcommand(monkeypatch, tmp_path: Path):
