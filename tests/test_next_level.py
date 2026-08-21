@@ -138,6 +138,7 @@ def test_listen_uses_voice_transcript_and_thread_history(tmp_path: Path):
             content="@bot hey",
             message_id="200",
             thread_id="th1",
+            author_id="human-1",
             metadata={"transcript": "hey discord os run tests"},
         )
     )

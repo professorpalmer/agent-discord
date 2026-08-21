@@ -406,8 +406,12 @@ def host_card(
     channel_id: str = "",
     confirm_off: bool = False,
     avatar_url: str = "",
+    spend_usd: float = 0.0,
+    cap_usd: Optional[float] = None,
+    halted: bool = False,
 ) -> CardMessage:
     _ = channel_id
+    spend_line = _host_spend_line(spend_usd, cap_usd, halted)
     if confirm_off:
         return CardMessage(
             kind="HOST",
@@ -417,20 +421,42 @@ def host_card(
             avatar_url=avatar_url,
         )
     if armed:
+        body = "Press Ask, or type a task here. Off needs a confirm."
+        if spend_line:
+            body = f"{body}\n{spend_line}"
         return CardMessage(
             kind="HOST",
-            title="Running",
-            description="Press Ask, or type a task here. Off needs a confirm.",
-            color=COLOR_LIVE,
+            title="Halted" if halted else "Running",
+            description=body,
+            color=COLOR_FAIL if halted else COLOR_LIVE,
             avatar_url=avatar_url,
         )
+    stopped = "Press On to start."
+    if spend_line:
+        stopped = f"{stopped}\n{spend_line}"
     return CardMessage(
         kind="HOST",
         title="Stopped",
-        description="Press On to start.",
+        description=stopped,
         color=COLOR_IDLE,
         avatar_url=avatar_url,
     )
+
+
+def _host_spend_line(
+    spend_usd: float,
+    cap_usd: Optional[float],
+    halted: bool,
+) -> str:
+    from agent_discord.orchestration.service import format_usd
+
+    line = f"Spend {format_usd(spend_usd)}"
+    if cap_usd is not None:
+        line += f" / {format_usd(cap_usd)}"
+    line += "."
+    if halted:
+        line += " Halted."
+    return line
 
 
 def render_overflow_card(

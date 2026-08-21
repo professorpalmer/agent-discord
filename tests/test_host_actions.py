@@ -50,7 +50,7 @@ def test_job_custom_ids_parse_without_host_power():
     assert panel_action_from_custom_id(cancel) is None
     assert panel_action_from_custom_id(retry) is None
     for custom_id in (approve, cancel, retry):
-        assert custom_id not in {ON_ID, OFF_ID, ASK_ID, JOBS_ID}
+        assert custom_id not in {ON_ID, OFF_ID, ASK_ID, JOBS_ID, "discord-os:pair", "discord-os:halt"}
 
 
 def test_confine_host_path_stays_inside_roots(tmp_path: Path):

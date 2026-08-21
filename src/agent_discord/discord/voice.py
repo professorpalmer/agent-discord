@@ -1,8 +1,8 @@
 """Voice-message detection, optional local whisper, and mobile widget hooks.
 
-WAVE 7 helpers only. Listen dispatch stays on text; a later wave can call
-these when a message already has a local transcript. This module never
-downloads Discord CDN attachments or whisper models.
+Fetches bot-visible Discord attachment bytes with the bot token when the
+REST poll already has a signed URL. Never stores that URL. Never downloads
+whisper models. Invokes argv lists only.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -32,6 +33,7 @@ _PUNCT_RE = re.compile(r"[,.!?;:]+")
 __all__ = [
     "available",
     "detect_voice_intent",
+    "materialize_voice_intake",
     "mobile_push_suffix",
     "spoken_command_to_intake",
     "transcribe_voice_attachment",
@@ -74,6 +76,47 @@ def detect_voice_intent(message: Any) -> Optional[dict[str, Any]]:
         "transcript": transcript,
         "intake": spoken_command_to_intake(transcript),
     }
+
+
+def materialize_voice_intake(message: Any, discord: Any = None) -> str:
+    """Turn a voice memo into intake text using local bytes or a bot-token fetch."""
+
+    meta = _metadata_of(message)
+    existing = str(meta.get("transcript") or meta.get("voice_transcript") or "").strip()
+    if existing:
+        return spoken_command_to_intake(existing) or existing
+    local_path = str(meta.get("local_audio_path") or "").strip()
+    if local_path:
+        return spoken_command_to_intake(transcribe_voice_attachment(local_path))
+    raw_bytes = meta.get("voice_bytes")
+    if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+        return _transcribe_bytes(bytes(raw_bytes), filename=_voice_filename(message))
+    token = _bot_token(discord)
+    if not token:
+        return ""
+    channel_id = str(getattr(message, "channel_id", "") or "")
+    message_id = str(getattr(message, "message_id", "") or "")
+    attachment_id = ""
+    for attachment in _attachments_of(message):
+        if _is_voice_attachment(attachment):
+            attachment_id = attachment.get("attachment_id") or ""
+            break
+    if not (channel_id and message_id and attachment_id):
+        return ""
+    try:
+        from agent_discord.discord.rest import fetch_message_attachment_bytes
+
+        payload = fetch_message_attachment_bytes(
+            token,
+            channel_id=channel_id,
+            message_id=message_id,
+            attachment_id=attachment_id,
+        )
+    except Exception:
+        return ""
+    if not payload:
+        return ""
+    return _transcribe_bytes(payload, filename=_voice_filename(message))
 
 
 def transcribe_voice_attachment(
@@ -278,3 +321,43 @@ def _transcript_of(message: Any) -> str:
     if isinstance(message, Mapping):
         return str(message.get("content") or "").strip()
     return ""
+
+
+def _transcribe_bytes(payload: bytes, *, filename: str) -> str:
+    suffix = Path(filename or "voice-message.ogg").suffix or ".ogg"
+    fd = None
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(prefix="discord-os-voice-", suffix=suffix)
+        os.write(fd, payload)
+        os.close(fd)
+        fd = None
+        return spoken_command_to_intake(transcribe_voice_attachment(path))
+    except OSError:
+        return ""
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _voice_filename(message: Any) -> str:
+    for attachment in _attachments_of(message):
+        if _is_voice_attachment(attachment) and attachment.get("filename"):
+            return attachment["filename"]
+    return "voice-message.ogg"
+
+
+def _bot_token(discord: Any) -> str:
+    if discord is None:
+        return ""
+    provider = getattr(discord, "provider", None)
+    token = getattr(provider, "_bot_token", "") or getattr(discord, "_bot_token", "")
+    return str(token or "").strip()

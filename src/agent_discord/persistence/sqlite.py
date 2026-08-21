@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from uuid import uuid4
@@ -129,6 +130,36 @@ CREATE TABLE IF NOT EXISTS preferences (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(workspace_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS operators (
+    user_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS operator_roles (
+    role_id TEXT PRIMARY KEY,
+    created_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    schedule_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    every_s INTEGER NOT NULL,
+    next_ms INTEGER NOT NULL,
+    created_by TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS spend_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    usd REAL NOT NULL,
+    created_ms INTEGER NOT NULL
+);
 """
 
 PREFERENCE_KINDS = frozenset({"preference", "style", "failure"})
@@ -151,6 +182,7 @@ class SQLiteStore:
         self._migrate_seen_messages(conn)
         self._migrate_artifacts(conn)
         self._migrate_preferences(conn)
+        self._migrate_service_tables(conn)
         self._fts_enabled = self._try_enable_fts(conn)
         conn.commit()
 
@@ -223,6 +255,38 @@ class SQLiteStore:
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_workspace_key
             ON preferences(workspace_id, key)
+            """
+        )
+
+    def _migrate_service_tables(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS operators (
+                user_id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operator_roles (
+                role_id TEXT PRIMARY KEY,
+                created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS schedules (
+                schedule_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                every_s INTEGER NOT NULL,
+                next_ms INTEGER NOT NULL,
+                created_by TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS spend_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                usd REAL NOT NULL,
+                created_ms INTEGER NOT NULL
+            );
             """
         )
 
@@ -667,6 +731,236 @@ class SQLiteStore:
         if len(block) > _PROMPT_MEMORY_BLOCK_CHARS:
             return block[: _PROMPT_MEMORY_BLOCK_CHARS - 3] + "..."
         return block
+
+    def merge_task_metadata(self, task_id: str, updates: Mapping[str, Any]) -> None:
+        row = self.get_task(task_id)
+        if row is None:
+            return
+        raw = row.get("metadata_json") or "{}"
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except json.JSONDecodeError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(dict(updates))
+        self._connection().execute(
+            "UPDATE tasks SET metadata_json=?, updated_at=datetime('now') WHERE task_id=?",
+            (json.dumps(meta, sort_keys=True), task_id),
+        )
+        self._connection().commit()
+
+    def task_metadata(self, task_id: str) -> dict[str, Any]:
+        row = self.get_task(task_id)
+        if row is None:
+            return {}
+        raw = row.get("metadata_json") or "{}"
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except json.JSONDecodeError:
+            return {}
+        return dict(meta) if isinstance(meta, dict) else {}
+
+    # --- operators ---
+
+    def add_operator(self, user_id: str, role: str = "operator") -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+        kind = str(role or "operator").strip().lower()
+        if kind not in {"owner", "operator"}:
+            raise ValueError("role must be owner or operator")
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO operators (user_id, role, created_ms)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET role=excluded.role
+            """,
+            (uid, kind, int(time.time() * 1000)),
+        )
+        conn.commit()
+
+    def add_operator_role(self, role_id: str) -> None:
+        rid = str(role_id or "").strip()
+        if not rid:
+            raise ValueError("role_id is required")
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO operator_roles (role_id, created_ms)
+            VALUES (?, ?)
+            ON CONFLICT(role_id) DO NOTHING
+            """,
+            (rid, int(time.time() * 1000)),
+        )
+        conn.commit()
+
+    def list_operators(self) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            "SELECT user_id, role, created_ms FROM operators ORDER BY created_ms ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_operator_roles(self) -> list[str]:
+        rows = self._connection().execute(
+            "SELECT role_id FROM operator_roles"
+        ).fetchall()
+        return [str(row["role_id"]) for row in rows]
+
+    def is_operator(
+        self,
+        user_id: str,
+        *,
+        role_ids: Optional[Sequence[str]] = None,
+    ) -> bool:
+        uid = str(user_id or "").strip()
+        if uid:
+            row = self._connection().execute(
+                "SELECT 1 FROM operators WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+            if row is not None:
+                return True
+        allowed = set(self.list_operator_roles())
+        if not allowed:
+            return False
+        for role_id in role_ids or ():
+            if str(role_id).strip() in allowed:
+                return True
+        return False
+
+    def seed_owner_if_empty(self, user_id: Optional[str]) -> bool:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return False
+        if self.list_operators():
+            return False
+        self.add_operator(uid, role="owner")
+        return True
+
+    def seed_owner_from_env(self, env: Optional[Mapping[str, str]] = None) -> None:
+        owner = str((env or os.environ).get("DISCORD_OWNER_ID") or "").strip()
+        if owner:
+            self.seed_owner_if_empty(owner)
+        roles = str((env or os.environ).get("DISCORD_OPERATOR_ROLE_IDS") or "")
+        for role_id in roles.replace(",", " ").split():
+            if role_id.strip():
+                self.add_operator_role(role_id.strip())
+
+    # --- spend ---
+
+    def record_spend(self, workspace_id: str, run_id: str, usd: float) -> None:
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO spend_events (workspace_id, run_id, usd, created_ms)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(workspace_id or "").strip() or "default",
+                str(run_id or "").strip(),
+                max(0.0, float(usd)),
+                int(time.time() * 1000),
+            ),
+        )
+        conn.commit()
+
+    def session_spend_usd(self, workspace_id: str = "") -> float:
+        conn = self._connection()
+        if workspace_id:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usd), 0) AS total FROM spend_events WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usd), 0) AS total FROM spend_events"
+            ).fetchone()
+        return float(row["total"] if row is not None else 0.0)
+
+    # --- schedules ---
+
+    def add_schedule(
+        self,
+        *,
+        channel_id: str,
+        workspace_id: str,
+        prompt: str,
+        every_s: int,
+        created_by: str = "",
+        next_ms: Optional[int] = None,
+    ) -> str:
+        schedule_id = uuid4().hex
+        now = int(time.time() * 1000)
+        interval = max(60, int(every_s))
+        due = int(next_ms) if next_ms is not None else now + interval * 1000
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO schedules (
+                schedule_id, channel_id, workspace_id, prompt,
+                every_s, next_ms, created_by, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                schedule_id,
+                str(channel_id or "").strip(),
+                str(workspace_id or "default").strip() or "default",
+                str(prompt or "").strip(),
+                interval,
+                due,
+                str(created_by or "").strip(),
+            ),
+        )
+        conn.commit()
+        return schedule_id
+
+    def due_schedules(
+        self,
+        now_ms: int,
+        channel_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        conn = self._connection()
+        if channel_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM schedules
+                WHERE enabled=1 AND next_ms<=? AND channel_id=?
+                ORDER BY next_ms ASC
+                """,
+                (int(now_ms), channel_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM schedules
+                WHERE enabled=1 AND next_ms<=?
+                ORDER BY next_ms ASC
+                """,
+                (int(now_ms),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bump_schedule(self, schedule_id: str, next_ms: int) -> None:
+        self._connection().execute(
+            "UPDATE schedules SET next_ms=? WHERE schedule_id=?",
+            (int(next_ms), schedule_id),
+        )
+        self._connection().commit()
+
+    def list_schedules(self, channel_id: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = self._connection()
+        if channel_id:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE channel_id=? ORDER BY next_ms ASC",
+                (channel_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM schedules ORDER BY next_ms ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # --- artifacts ---
 

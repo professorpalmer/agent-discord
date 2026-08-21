@@ -15,6 +15,8 @@ ASK_ID = "discord-os:ask"
 ASK_MODAL_ID = "discord-os:ask-modal"
 ASK_TEXT_ID = "discord-os:ask-text"
 JOBS_ID = "discord-os:jobs"
+PAIR_ID = "discord-os:pair"
+HALT_ID = "discord-os:halt"
 COMPONENT_ROW = 1
 BUTTON = 2
 STYLE_PRIMARY = 1
@@ -84,7 +86,21 @@ def host_panel_components(
                     ]
                     if armed
                     else []
-                ),
+                )
+                + [
+                    {
+                        "type": BUTTON,
+                        "style": STYLE_PRIMARY,
+                        "custom_id": PAIR_ID,
+                        "label": "Pair",
+                    },
+                    {
+                        "type": BUTTON,
+                        "style": STYLE_DANGER,
+                        "custom_id": HALT_ID,
+                        "label": "Halt",
+                    },
+                ],
             }
         ]
     options = _job_select_options(jobs or ())
@@ -185,14 +201,35 @@ def host_panel_payload(
     confirm_off: bool = False,
     jobs: Optional[list[dict[str, Any]]] = None,
     avatar_url: str = "",
+    store: Any = None,
 ) -> dict[str, Any]:
     from agent_discord.orchestration.cards import host_card
+    from agent_discord.orchestration.service import (
+        is_spend_halted,
+        session_spend_usd,
+        spend_cap_usd,
+    )
 
+    spend_usd = 0.0
+    cap_usd = None
+    halted = False
+    if store is not None:
+        try:
+            spend_usd = session_spend_usd(store)
+            cap_usd = spend_cap_usd(store)
+            halted = is_spend_halted(store)
+        except Exception:
+            spend_usd = 0.0
+            cap_usd = None
+            halted = False
     card = host_card(
         armed=armed,
         channel_id=channel_id,
         confirm_off=confirm_off,
         avatar_url=avatar_url,
+        spend_usd=spend_usd,
+        cap_usd=cap_usd,
+        halted=halted,
     )
     return card.v2_payload(
         rows=host_panel_components(armed, confirm_off=confirm_off, jobs=jobs)
@@ -213,6 +250,10 @@ def panel_action_from_custom_id(custom_id: str) -> Optional[str]:
         return "ask"
     if raw == JOBS_ID:
         return "job"
+    if raw == PAIR_ID:
+        return "pair"
+    if raw == HALT_ID:
+        return "halt"
     return None
 
 
@@ -259,6 +300,30 @@ def interaction_callback_payload(
 
 def interaction_ids(payload: Mapping[str, Any]) -> tuple[str, str]:
     return str(payload.get("id") or ""), str(payload.get("token") or "")
+
+
+def interaction_user_id(payload: Mapping[str, Any]) -> str:
+    member = payload.get("member")
+    if isinstance(member, dict):
+        user = member.get("user")
+        if isinstance(user, dict) and user.get("id"):
+            return str(user.get("id") or "")
+        roles = member.get("roles")
+        _ = roles
+    user = payload.get("user")
+    if isinstance(user, dict):
+        return str(user.get("id") or "")
+    return ""
+
+
+def interaction_role_ids(payload: Mapping[str, Any]) -> list[str]:
+    member = payload.get("member")
+    if not isinstance(member, dict):
+        return []
+    roles = member.get("roles")
+    if isinstance(roles, list):
+        return [str(item) for item in roles if str(item).strip()]
+    return []
 
 
 def handle_gateway_interaction(
@@ -327,7 +392,97 @@ def handle_gateway_interaction(
     action = panel_action_from_interaction(payload)
     if action is None:
         return None
+    from agent_discord.orchestration.service import (
+        author_may_operate,
+        seed_owner_if_empty,
+        toggle_spend_halted,
+    )
+
+    user_id = interaction_user_id(payload)
+    role_ids = interaction_role_ids(payload)
+    if action == "pair":
+        seed_owner_if_empty(store, user_id)
+    if action == "on":
+        seed_owner_if_empty(store, user_id)
+    if not author_may_operate(store, user_id, action, role_ids=role_ids):
+        interaction_id, ix_token = interaction_ids(payload)
+        if interaction_id and ix_token:
+            try:
+                from agent_discord.discord.rest import callback_interaction
+
+                callback_interaction(
+                    interaction_id=interaction_id,
+                    interaction_token=ix_token,
+                    payload={"type": CALLBACK_DEFERRED_UPDATE},
+                    opener=opener,
+                )
+            except Exception:
+                pass
+        return "denied"
     interaction_id, ix_token = interaction_ids(payload)
+    if action == "halt":
+        if interaction_id and ix_token:
+            try:
+                from agent_discord.discord.rest import callback_interaction
+
+                callback_interaction(
+                    interaction_id=interaction_id,
+                    interaction_token=ix_token,
+                    payload={"type": CALLBACK_DEFERRED_UPDATE},
+                    opener=opener,
+                )
+            except Exception:
+                pass
+        toggle_spend_halted(store)
+        message_id = _remember_panel_message(store, channel_id, payload)
+        armed = True
+        reader = getattr(store, "host_is_armed", None)
+        if callable(reader):
+            try:
+                armed = bool(reader(channel_id, default=True))
+            except Exception:
+                armed = True
+        _paint_host_panel(
+            store,
+            channel_id,
+            token=token,
+            message_id=message_id,
+            armed=armed,
+            confirm_off=False,
+            opener=opener,
+        )
+        return action
+    if action == "pair":
+        if interaction_id and ix_token:
+            try:
+                from agent_discord.discord.rest import callback_interaction
+
+                callback_interaction(
+                    interaction_id=interaction_id,
+                    interaction_token=ix_token,
+                    payload={"type": CALLBACK_DEFERRED_UPDATE},
+                    opener=opener,
+                )
+            except Exception:
+                pass
+        message_id = _remember_panel_message(store, channel_id, payload)
+        armed = True
+        reader = getattr(store, "host_is_armed", None)
+        if callable(reader):
+            try:
+                armed = bool(reader(channel_id, default=True))
+            except Exception:
+                armed = True
+        _paint_host_panel(
+            store,
+            channel_id,
+            token=token,
+            message_id=message_id,
+            armed=armed,
+            confirm_off=False,
+            opener=opener,
+        )
+        return action
     if action == "ask":
         if interaction_id and ix_token:
             try:
@@ -456,6 +611,7 @@ def _paint_host_panel(
         confirm_off=confirm_off,
         jobs=_panel_jobs(store, channel_id),
         avatar_url=_panel_avatar(token, opener),
+        store=store,
     )
     edit_channel_message(
         token=token,

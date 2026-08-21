@@ -15,9 +15,11 @@ from agent_discord.host.panel import (
     ASK_MODAL_ID,
     CANCEL_OFF_ID,
     CONFIRM_OFF_ID,
+    HALT_ID,
     JOBS_ID,
     OFF_ID,
     ON_ID,
+    PAIR_ID,
     ask_modal_payload,
     ask_text_from_interaction,
     handle_gateway_interaction,
@@ -71,7 +73,7 @@ def test_websocket_frame_roundtrip():
 def test_panel_buttons_and_interaction_parse():
     buttons = host_panel_components(False)
     ids = [item["custom_id"] for item in buttons[0]["components"]]
-    assert ids == [ON_ID, OFF_ID]
+    assert ids == [ON_ID, OFF_ID, PAIR_ID, HALT_ID]
     armed = host_panel_components(True)
     assert ASK_ID in [item["custom_id"] for item in armed[0]["components"]]
     assert panel_action_from_interaction(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discord-os"
-version = "0.4.0"
+version = "0.5.0"
 description = "Discord OS: Discord is the harness UI for local agent work. Artifacts are Discord objects (snowflake IDs)."
 readme = "README.md"
 license = { text = "MIT" }
@@ -32,7 +32,7 @@ discord-os = "agent_discord.cli:main"
 agent-discord = "agent_discord.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/professorpalmer/agent-discord"
+Homepage = "https://github.com/professorpalmer/discord-os"
 Attribution-SaseQ = "https://github.com/SaseQ/discord-mcp"
 Attribution-BrainDAO = "https://github.com/BrainDAO/mcp-discord"
 
