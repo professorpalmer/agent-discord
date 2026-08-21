@@ -114,8 +114,11 @@ def test_e2e_parallel_realms_think_tank_and_tools(tmp_path: Path, monkeypatch):
     assert tank
     assert "personal graph" in tank[0]["content"]
 
-    sent_ids = {msg.message_id for msg in fake.sent if msg.channel_id in {"ch-pm", "ch-dug"}}
-    assert len(sent_ids) == 2
+    job_msgs = [msg for msg in fake.sent if msg.channel_id in {"ch-pm", "ch-dug"}]
+    cards = [msg for msg in job_msgs if not (msg.content or "").strip()]
+    assert len(cards) == 2
+    assert all(getattr(msg, "thread_id", None) for msg in cards)
+    assert len(fake.threads) >= 2
     tank_blob = json.dumps([getattr(msg, "metadata", {}) for msg in fake.sent])
     assert "list open pull requests" in tank_blob or "Note" in tank_blob
     store.close()

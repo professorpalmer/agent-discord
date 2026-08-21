@@ -51,14 +51,10 @@ def tools_reach_block(tools: Sequence[HostTool] = ()) -> str:
     catalog = tuple(tools) if tools else load_host_tools()
     lines = [
         "Host tools (CLI or HTTP — not MCP inside Discord):",
-        "- Call these from the shell. Do not wait for Cursor MCP.",
-        "- discord-os wiki query \"...\"  (portable LLM wiki HTTP)",
-        "- discord-os recall \"...\"      (other Discord channels as memory)",
-        "- discord-os note \"...\"        (write into the think-tank)",
+        "- discord-os wiki query / recall / note from the shell.",
     ]
     ready = [item for item in catalog if item.ready]
     if not ready:
-        lines.append("- No extra host tools are configured yet.")
         return "\n".join(lines)
     lines.append("- Ready on this Mac:")
     for tool in ready:
@@ -80,7 +76,9 @@ def _wiki_tool(env: Mapping[str, str]) -> HostTool:
 
 
 def _bin_tool(name: str, hint: str) -> HostTool:
-    path = shutil.which(name) or ""
+    from agent_discord.host.repos import which_on_host
+
+    path = which_on_host(name) or shutil.which(name) or ""
     return HostTool(
         name=name,
         kind="cli",

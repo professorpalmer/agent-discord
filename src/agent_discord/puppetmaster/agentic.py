@@ -28,6 +28,7 @@ from agent_discord.puppetmaster.backend import (
     iter_cli_process_events,
     prepend_early_job_id,
     request_workdir,
+    worker_env,
 )
 from agent_discord.puppetmaster.models import AGENTIC_MODEL_PIN
 
@@ -128,7 +129,7 @@ class AgenticPuppetmasterBackend:
         if workdir:
             command.extend(["--cwd", workdir])
 
-        child_env = dict(self.env) if self.env is not None else dict(os.environ)
+        child_env = worker_env(self.env)
         secret = self._resolve_secret()
         if secret:
             child_env["OPENROUTER_API_KEY"] = secret
@@ -261,7 +262,7 @@ class AgenticPuppetmasterBackend:
                 "--timeout-seconds",
                 str(int(self.timeout_seconds)),
                 "--worker-mode",
-                "subprocess",
+                "inline",
             ]
         )
         if mode == "implement":
@@ -275,7 +276,7 @@ class AgenticPuppetmasterBackend:
         if cli_supports_flag(self.cli, "agentic", "--json-lines"):
             command.append("--json-lines")
 
-        child_env = dict(self.env) if self.env is not None else dict(os.environ)
+        child_env = worker_env(self.env)
         secret = self._resolve_secret()
         if secret:
             child_env["OPENROUTER_API_KEY"] = secret

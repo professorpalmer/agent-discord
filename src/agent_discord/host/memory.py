@@ -209,14 +209,10 @@ def memory_reach_block(
     ids = memory_channel_ids(store, workspace_id=workspace_id, env=env) if store is not None else ()
     lines = [
         "Think-tank (Discord is the durable store):",
-        "- Other bound channels are group-chat memory, not a second computer.",
-        "- `bind memory` in a channel makes it a bank. `discord-os recall` reads it.",
-        "- `discord-os note \"...\"` writes a note the next run can see.",
+        "- Bound channels are memory. Use discord-os recall / note.",
     ]
     if ids:
         lines.append("- Memory channels: " + ", ".join(ids))
-    else:
-        lines.append("- No memory channels yet. Send `bind memory` in the bank room.")
     return "\n".join(lines)
 
 

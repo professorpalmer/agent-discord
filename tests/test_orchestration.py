@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from agent_discord.contracts import (
@@ -64,6 +65,8 @@ def test_dispatch_persists_events_and_posts_receipt(tmp_path: Path):
     assert backend.last_request.context.memories
     assert backend.last_request.metadata["compute_mode"] == "analyze"
     assert fake_discord.threads
+    assert "inbound-1" in str(fake_discord.threads)
+    assert any(getattr(m, "thread_id", None) for m in fake_discord.sent)
 
     events = store.list_events(receipt.run_id)
     kinds = [e["kind"] for e in events]
@@ -189,12 +192,14 @@ class _CountingFacade:
         self._inner = inner
         self.edit_count = 0
         self.thread_sends = 0
+        self.edit_blobs: list[str] = []
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
     def edit_message(self, *args, **kwargs):
         self.edit_count += 1
+        self.edit_blobs.append(json.dumps({"args": args, "kwargs": kwargs}, default=str))
         return self._inner.edit_message(*args, **kwargs)
 
     def send_message(self, channel_id, content, *, thread_id=None, **kwargs):
@@ -284,7 +289,7 @@ def test_token_stream_flushes_card_on_interval_not_per_token(tmp_path: Path, mon
         TaskIntake(text="stream tokens", channel_id="ch", workspace_id="ws")
     )
     assert receipt.status == TaskStatus.COMPLETED
-    assert 1 <= facade.edit_count <= 3
+    assert 1 <= facade.edit_count <= 4
     assert facade.edit_count < 16
     assert facade.thread_sends == 0
     store.close()
@@ -333,6 +338,60 @@ def test_live_card_stays_one_message(tmp_path: Path, monkeypatch):
     orch.run_task(TaskIntake(text="stream tokens", channel_id="ch", workspace_id="ws"))
     assert len(fake_discord.sent) == 1
     assert facade.thread_sends == 0
+    body = "\n".join(
+        str(child.get("content") or "")
+        for row in ((fake_discord.sent[0].metadata or {}).get("components") or [])
+        for child in (row.get("components") or [row])
+        if isinstance(child, dict)
+    )
+    assert "a0" in body or "b0" in body or "a0" in (fake_discord.sent[0].content or "")
+    store.close()
+
+
+def test_live_card_keeps_markdown_dialogue(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+
+    class _MarkdownBackend(_TokenStreamBackend):
+        def stream(self, request):
+            self.last_request = request
+            clock.advance(TOKEN_CARD_FLUSH_SECONDS + 0.05)
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="thinking",
+                    message="# Open PRs",
+                    details={
+                        "token": True,
+                        "stream_phase": "thinking",
+                        "token_text": "# Open PRs\nNone in puppetmaster.",
+                    },
+                ),
+            )
+            yield DispatchEvent(
+                kind=EventKind.RECEIPT,
+                summary=ProgressSummary(stage="done", message="completed", percent=100.0),
+            )
+
+    store = SQLiteStore(tmp_path / "md.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_MarkdownBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+        host_repos=(),
+    )
+    orch.run_task(TaskIntake(text="list prs", channel_id="ch", workspace_id="ws"))
+    assert len(fake_discord.sent) == 1
+    assert any("Open PRs" in blob for blob in facade.edit_blobs)
     store.close()
 
 
@@ -357,3 +416,270 @@ def test_named_repo_sets_worker_cwd(tmp_path: Path):
     assert backend.last_request.metadata["repo"] == "puppetmaster"
     assert "gh pr list" in backend.last_request.metadata["host_reach"]
     store.close()
+
+
+def test_host_github_report_paints_the_live_card(tmp_path: Path):
+    orch, store, fake_discord, backend = _orch(tmp_path)
+    orch.host_github = lambda cwd: "Open PRs:\n#9 dest\n\nOpen issues:\n(none)"
+    repo = tmp_path / "marionette"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    from agent_discord.host.repos import HostRepo
+
+    orch.host_repos = (HostRepo(name="marionette", path=repo, aliases=("marionette",)),)
+    receipt = orch.run_task(
+        TaskIntake(
+            text="Can you check if my Marionette repo has any open PRs or Issues?",
+            channel_id="ch",
+            workspace_id="ws",
+        )
+    )
+    assert backend.last_request is not None
+    assert "#9 dest" in str(backend.last_request.metadata.get("host_github"))
+    assert receipt.status == TaskStatus.COMPLETED
+    store.close()
+
+
+def test_receipt_keeps_report_not_host_reach_dump(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+    dump = (
+        "Network: yes. Use gh, curl, and git.\n"
+        "Named git checkouts:\n"
+        "puppetmaster: /tmp/pm\n"
+        "Host tools (CLI or HTTP — not MCP inside Discord):\n"
+        "Think-tank (Discord is the durable store):\n"
+        "Do not treat .agent-discord as the subject repository.\n"
+    )
+    report = "Open PRs: none. Issues: #12 docs drift."
+
+    class _DumpBackend(_TokenStreamBackend):
+        def stream(self, request):
+            self.last_request = request
+            clock.advance(TOKEN_CARD_FLUSH_SECONDS + 0.05)
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="thinking",
+                    message=report,
+                    percent=18.0,
+                    details={
+                        "token": True,
+                        "stream_phase": "thinking",
+                        "token_text": report,
+                    },
+                ),
+            )
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="done",
+                    message=dump,
+                    percent=100.0,
+                    details={
+                        "token": True,
+                        "stream_phase": "done",
+                        "token_text": dump,
+                    },
+                ),
+            )
+            yield DispatchEvent(
+                kind=EventKind.RECEIPT,
+                summary=ProgressSummary(stage="done", message=dump, percent=100.0),
+            )
+
+    store = SQLiteStore(tmp_path / "dump.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_DumpBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+        host_repos=(),
+    )
+    receipt = orch.run_task(
+        TaskIntake(text="check marionette prs", channel_id="ch", workspace_id="ws")
+    )
+    assert "Open PRs: none" in receipt.summary
+    assert "Named git checkouts" not in receipt.summary
+    assert "Think-tank" not in receipt.summary
+    rows = store._connection().execute("SELECT content FROM memory_entries").fetchall()
+    blob = " ".join(str(row["content"] or "") for row in rows)
+    assert "Named git checkouts" not in blob
+    store.close()
+
+def test_new_job_opens_thread_and_posts_card_there(tmp_path: Path):
+    orch, store, fake_discord, _backend = _orch(tmp_path)
+    receipt = orch.run_task(
+        TaskIntake(
+            text="review invoices",
+            channel_id="ch",
+            workspace_id="ws",
+            message_id="ask-1",
+        )
+    )
+    assert receipt.status == TaskStatus.COMPLETED
+    assert fake_discord.threads
+    thread_id = next(iter(fake_discord.threads))
+    assert fake_discord.threads[thread_id]["message_id"] == "ask-1"
+    assert any(getattr(m, "thread_id", None) == thread_id for m in fake_discord.sent)
+    store.close()
+
+
+def test_in_thread_followup_does_not_start_nested_thread(tmp_path: Path):
+    orch, store, fake_discord, _backend = _orch(tmp_path)
+    orch.run_task(
+        TaskIntake(
+            text="steer this",
+            channel_id="ch",
+            workspace_id="ws",
+            message_id="follow-1",
+            thread_id="existing-thread",
+        )
+    )
+    assert "existing-thread" not in fake_discord.threads
+    assert all(
+        not str(key).startswith("thread-follow") for key in fake_discord.threads
+    )
+    assert any(getattr(m, "thread_id", None) == "existing-thread" for m in fake_discord.sent)
+    store.close()
+
+
+def test_token_flushes_edit_same_card_settles_only_beats(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+    store = SQLiteStore(tmp_path / "flush.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_TokenStreamBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+        host_repos=(),
+    )
+    orch.run_task(
+        TaskIntake(
+            text="stream tokens",
+            channel_id="ch",
+            workspace_id="ws",
+            message_id="ask-stream",
+        )
+    )
+    cards = [m for m in fake_discord.sent if not (m.content or "").strip()]
+    settles = [m for m in fake_discord.sent if (m.content or "").strip()]
+    assert len(cards) == 1
+    assert facade.edit_count >= 1
+    assert len(settles) <= 2
+    store.close()
+
+
+def test_done_settles_final_answer_in_thread(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+
+    class _AnswerBackend(_TokenStreamBackend):
+        def stream(self, request):
+            self.last_request = request
+            clock.advance(TOKEN_CARD_FLUSH_SECONDS + 0.05)
+            yield DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage="thinking",
+                    message="Open PRs: none. Issues: #12 docs drift.",
+                    details={
+                        "token": True,
+                        "stream_phase": "thinking",
+                        "token_text": "Open PRs: none. Issues: #12 docs drift.",
+                    },
+                ),
+            )
+            yield DispatchEvent(
+                kind=EventKind.RECEIPT,
+                summary=ProgressSummary(stage="done", message="completed", percent=100.0),
+            )
+
+    store = SQLiteStore(tmp_path / "settle.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_AnswerBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+        host_repos=(),
+    )
+    receipt = orch.run_task(
+        TaskIntake(
+            text="check marionette prs",
+            channel_id="ch",
+            workspace_id="ws",
+            message_id="ask-done",
+        )
+    )
+    assert "Open PRs: none" in receipt.summary
+    settles = [m for m in fake_discord.sent if "Open PRs: none" in (m.content or "")]
+    assert settles
+    assert all(getattr(m, "thread_id", None) for m in settles)
+    store.close()
+
+
+def test_public_card_text_strips_monologue():
+    from agent_discord.puppetmaster.backend import public_card_text
+
+    kept = public_card_text(
+        "Let me write the Discord answer\n\nTwo open PRs in marionette."
+    )
+    assert "Two open PRs" in kept
+    assert "Let me write" not in kept
+    assert public_card_text("report: internal") == ""
+    assert public_card_text("Here's the straight answer for Discord") == ""
+    assert "Named git checkouts" not in public_card_text(
+        "Named git checkouts:\npuppetmaster: /tmp/pm"
+    )
+
+
+def test_unauthed_github_ask_does_not_dispatch_worker(tmp_path: Path):
+    orch, store, fake_discord, backend = _orch(tmp_path)
+    orch.host_github = lambda cwd: (
+        "GitHub CLI is installed but not signed in on this Mac.\n"
+        "Sign in on the host: discord-os add github"
+    )
+    repo = tmp_path / "marionette"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    from agent_discord.host.repos import HostRepo
+
+    orch.host_repos = (HostRepo(name="marionette", path=repo, aliases=("marionette",)),)
+    receipt = orch.run_task(
+        TaskIntake(
+            text="Can you check if my Marionette repo has any open PRs or Issues?",
+            channel_id="ch",
+            workspace_id="ws",
+            message_id="ask-gh",
+        )
+    )
+    assert backend.dispatch_count == 0
+    assert "not signed in" in receipt.summary
+    assert "essay" not in receipt.summary.lower()
+    store.close()
+

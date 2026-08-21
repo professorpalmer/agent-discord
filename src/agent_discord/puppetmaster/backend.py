@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import shutil
@@ -35,7 +36,7 @@ RECEIPT_TEXT_LIMIT = 1800
 STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
 _CLI_FLAG_CACHE: dict[tuple[str, str, str], bool] = {}
 _SUMMARY_SKIP_PREFIXES = (
-    "#",
+    "# puppetmaster stitched summary",
     "---",
     "goal:",
     "role:",
@@ -56,9 +57,23 @@ _SUMMARY_SKIP_PREFIXES = (
     "do not repeat",
     "internal:",
     "task:",
+    "- task:",
     "[failures]",
     "[preferences]",
     "[style]",
+    "host reach",
+    "network:",
+    "named git checkouts",
+    "host tools",
+    "think-tank",
+    "this run cwd",
+    "do not treat .agent-discord",
+    "no extra host tools",
+    "no memory channels",
+    "context memories:",
+    "call these from the shell",
+    "other bound channels",
+    "dispatched via",
     "[swarm.",
     "decision:",
     "finding:",
@@ -67,7 +82,43 @@ _SUMMARY_SKIP_PREFIXES = (
     "confidence=",
     "outcome:",
     "full report:",
-    "host reach",
+    "report:",
+    "let me write the discord answer",
+    "here's the straight answer for discord",
+    "here's the answer for discord",
+    "let me analyze this task",
+    "no memory channels yet",
+)
+_PROMPT_ECHO_MARKERS = (
+    "named git checkouts:",
+    "host tools (cli",
+    "think-tank (discord",
+    "host reach (this mac",
+    "do not treat .agent-discord",
+    "no extra host tools",
+    "no memory channels yet",
+    "context memories:",
+    "write the answer as visible prose",
+)
+
+_STRONG_ECHO_MARKERS = (
+    "named git checkouts:",
+    "host tools (cli",
+    "host reach (this mac",
+    "think-tank (discord",
+    "do not treat .agent-discord",
+    "gh auth login",
+    "to get started with github cli",
+    "no memory channels yet",
+    "no extra host tools",
+)
+
+_MONOLOGUE_PREFIXES = (
+    "let me write the discord answer",
+    "here's the straight answer for discord",
+    "here's the answer for discord",
+    "let me analyze this task",
+    "report:",
 )
 
 
@@ -201,6 +252,7 @@ class PuppetmasterCliBackend:
                 timeout=self.timeout_seconds,
                 check=False,
                 cwd=workdir,
+                env=worker_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._statuses[request.run_id] = TaskStatus.FAILED
@@ -328,6 +380,7 @@ class PuppetmasterCliBackend:
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=workdir,
+                env=worker_env(),
             )
         except OSError as exc:
             self._statuses[request.run_id] = TaskStatus.FAILED
@@ -367,7 +420,7 @@ def _safe_dispatch_prompt(request: DispatchRequest) -> str:
     for item in list(request.context.memories)[:8]:
         if isinstance(item, dict):
             content = str(item.get("content") or "").strip()
-            if content:
+            if content and not is_prompt_echo(content) and "[failures]" not in content.lower():
                 memory_bits.append(content[:400])
     lines = [
         request.prompt.strip(),
@@ -383,10 +436,25 @@ def _safe_dispatch_prompt(request: DispatchRequest) -> str:
     channel = request.metadata.get("channel_id") if request.metadata else None
     if channel:
         lines.append(f"channel_id={channel}")
+    host_github = ""
     reach = ""
     if request.metadata:
+        host_github = str(request.metadata.get("host_github") or "").strip()
         reach = str(request.metadata.get("host_reach") or "").strip()
-    if reach:
+    if request.metadata and request.metadata.get("steer"):
+        lines.append("")
+        lines.append(
+            "This is a steer in the same job thread. Continue the conversation. "
+            "Do not restart the task."
+        )
+    if host_github:
+        lines.append("")
+        lines.append(
+            "Host already queried GitHub on this Mac. Answer from this output. "
+            "Do not claim gh is sandboxed or missing. Do not run gh yourself."
+        )
+        lines.append(host_github)
+    elif reach:
         lines.append("")
         lines.append(reach)
     if memory_bits:
@@ -428,8 +496,42 @@ _SAFE_SUMMARY_KEYS = frozenset(
 
 def prepend_early_job_id(command: list[str]) -> list[str]:
     if len(command) < 2 or command[1] == "--emit-job-id-early":
-        return list(command)
-    return [command[0], "--emit-job-id-early", *command[1:]]
+        return with_state_dir(list(command))
+    return with_state_dir([command[0], "--emit-job-id-early", *command[1:]])
+
+
+def with_state_dir(command: list[str], state_dir: str = "") -> list[str]:
+    cmd = list(command)
+    path = (state_dir or resolved_state_dir()).strip()
+    if not cmd or not path or "--state-dir" in cmd:
+        return cmd
+    return [cmd[0], "--state-dir", path, *cmd[1:]]
+
+
+def resolved_state_dir(base: Optional[Mapping[str, str]] = None) -> str:
+    """One Puppetmaster state dir for the worker and ``deltas --follow``."""
+
+    source = os.environ if base is None else base
+    raw = str(source.get("PUPPETMASTER_STATE_DIR") or "").strip()
+    if raw:
+        return str(Path(raw).expanduser())
+    workspace = str(source.get("AGENT_DISCORD_WORKSPACE") or "").strip()
+    if workspace:
+        return str(Path(workspace).expanduser() / "puppetmaster")
+    return str(Path.home() / ".discord-os" / "puppetmaster")
+
+
+def worker_env(base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    from agent_discord.host.github import load_host_tool_secrets
+    from agent_discord.host.repos import host_path
+
+    env = dict(os.environ if base is None else base)
+    env["PATH"] = host_path(env)
+    env["PUPPETMASTER_STATE_DIR"] = resolved_state_dir(env)
+    secrets = load_host_tool_secrets(env=None if base is None else base)
+    for key, value in secrets.items():
+        env.setdefault(key, value)
+    return env
 
 
 def request_workdir(
@@ -447,12 +549,76 @@ def request_workdir(
     return None
 
 
+def is_prompt_echo(text: str) -> bool:
+    """True when the worker repeated the host-reach / memory prompt."""
+
+    lower = (text or "").lower()
+    if any(marker in lower for marker in _STRONG_ECHO_MARKERS):
+        return True
+    hits = 0
+    for marker in _PROMPT_ECHO_MARKERS:
+        if marker in lower:
+            hits += 1
+        if hits >= 2:
+            return True
+    return False
+
+
+def _strip_monologue_prefix(raw: str) -> str:
+    text = (raw or "").strip()
+    lower = text.lower()
+    if lower.startswith("report:"):
+        return ""
+    for prefix in _MONOLOGUE_PREFIXES:
+        if prefix == "report:":
+            continue
+        bare = prefix.rstrip(":")
+        if lower == prefix or lower.rstrip(".:,") == bare:
+            return ""
+        if lower.startswith(prefix):
+            return text[len(prefix) :].lstrip(" .:-	")
+    return text
+
+
+def public_card_text(text: str, *, fallback: str = "") -> str:
+    """User-facing card body. Drops monologue, prompt echoes, auth dumps."""
+
+    raw = (text or "").strip()
+    if not raw:
+        return fallback
+    try:
+        from agent_discord.host.github import is_github_auth_dump
+    except Exception:
+        def is_github_auth_dump(value: str) -> bool:
+            return "gh auth login" in (value or "").lower()
+
+    if is_github_auth_dump(raw):
+        return fallback
+    body = usable_worker_text(raw)
+    if not body or is_prompt_echo(body) or is_github_auth_dump(body):
+        return fallback
+    return body
+
+
+def choose_spoken_answer(*candidates: str) -> str:
+    """First human answer that is not CLI metadata or a prompt echo."""
+
+    for raw in candidates:
+        spoken = usable_worker_text(redact_text_markers(raw or ""))
+        if not spoken or _is_placeholder_summary(spoken) or is_prompt_echo(spoken):
+            continue
+        if spoken.lower().startswith("dispatched via"):
+            continue
+        return spoken
+    return ""
+
+
 def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
     """Keep human dialogue. Drop prompt echoes and CLI metadata."""
 
     parts: list[str] = []
     for line in (text or "").splitlines():
-        raw = line.strip()
+        raw = _strip_monologue_prefix(line.strip())
         if not raw:
             if parts and parts[-1] != "":
                 parts.append("")
@@ -642,6 +808,17 @@ class TokenStreamBuffer:
         return self.phase
 
 
+def _extend_visible(buffer: TokenStreamBuffer, chunk: str) -> str:
+    """Append worker text as a paragraph, not one Discord line per token."""
+
+    text = (chunk or "").strip()
+    if not text:
+        return buffer.text
+    if buffer.text and not buffer.text.endswith((" ", "\n")):
+        buffer.extend(" ")
+    return buffer.extend(text)
+
+
 def _normalize_stream_phase(raw: str, default: str = "thinking") -> str:
     stage = (raw or "").strip().lower()
     stage = _PHASE_ALIASES.get(stage, stage)
@@ -799,7 +976,7 @@ def _prose_token_event(
     chunk = redact_text_markers(raw)
     if not chunk.strip():
         return None
-    buffer.extend(chunk + "\n")
+    _extend_visible(buffer, chunk)
     return DispatchEvent(
         kind=EventKind.PROGRESS,
         summary=ProgressSummary(
@@ -822,18 +999,21 @@ def _start_delta_follower(cli: str, job_id: str, timeout_seconds: float) -> Opti
         return None
     try:
         return subprocess.Popen(
-            [
-                cli,
-                "deltas",
-                ident,
-                "--follow",
-                "--json",
-                "--follow-timeout-seconds",
-                str(max(8, int(timeout_seconds))),
-            ],
+            with_state_dir(
+                [
+                    cli,
+                    "deltas",
+                    ident,
+                    "--follow",
+                    "--json",
+                    "--follow-timeout-seconds",
+                    str(max(8, int(timeout_seconds))),
+                ]
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            env=worker_env(),
         )
     except OSError:
         return None

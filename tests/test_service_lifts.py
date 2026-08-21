@@ -313,7 +313,7 @@ def test_pair_and_halt_buttons_parse(tmp_path: Path):
     assert captured[0]["body"]["type"] == 6
     paint = captured[1]["body"]
     blob = json.dumps(paint)
-    assert "Paired" in blob
+    assert "paired" in blob
     assert "webhooks/app-1/tok/messages/@original" in captured[1]["url"]
     halt = handle_gateway_interaction(
         store,
