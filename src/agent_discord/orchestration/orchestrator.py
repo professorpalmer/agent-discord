@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
@@ -44,6 +46,10 @@ from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
 
 TOKEN_CARD_FLUSH_SECONDS = 0.35
 TOKEN_TEXT_LIMIT = 1500
+CHANNEL_TLDR_LIMIT = 160
+SETTLE_SHORT_LIMIT = 280
+SETTLE_BUBBLE_SOFT = 420
+SETTLE_MAX_BUBBLES = 3
 _STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
 _SWARM_ROLES = (
     "explore",
@@ -140,6 +146,103 @@ def _is_settle_worthy(text: str) -> bool:
     return True
 
 
+def _settle_bubbles(text: str) -> list[str]:
+    """Public-safe persist-then-settle bodies. Prefer 2; 3 only if needed."""
+
+    from agent_discord.puppetmaster.backend import (
+        _same_beat,
+        _split_sentences,
+        public_card_text,
+    )
+
+    body = public_card_text(text).strip()
+    if not body or not _is_settle_worthy(body):
+        return []
+    sentences: list[str] = []
+    for part in _split_sentences(body):
+        sentence = part.strip()
+        if not sentence:
+            continue
+        if sentences and _same_beat(sentences[-1], sentence):
+            continue
+        sentences.append(sentence)
+    if not sentences:
+        return [body]
+    if len(sentences) == 1 or len(body) <= SETTLE_SHORT_LIMIT:
+        return [body]
+    count = 2
+    packed_two = _pack_settle_sentences(sentences, 2)
+    if (
+        len(sentences) >= 3
+        and packed_two
+        and max(len(chunk) for chunk in packed_two) > SETTLE_BUBBLE_SOFT
+    ):
+        count = 3
+    count = min(SETTLE_MAX_BUBBLES, len(sentences), count)
+    return _pack_settle_sentences(sentences, count) or [body]
+
+
+def _pack_settle_sentences(sentences: list[str], count: int) -> list[str]:
+    parts = [item.strip() for item in sentences if item.strip()]
+    if not parts:
+        return []
+    n = min(max(count, 1), SETTLE_MAX_BUBBLES, len(parts))
+    if n <= 1:
+        return [" ".join(parts)]
+    weights = [len(item) for item in parts]
+    total = sum(weights)
+    target = total / n
+    cuts: list[int] = []
+    acc = 0
+    next_cut = 1
+    for index, weight in enumerate(weights[:-1]):
+        acc += weight
+        if acc + 1e-9 >= target * next_cut:
+            cuts.append(index + 1)
+            next_cut += 1
+            if next_cut >= n:
+                break
+    starts = [0, *cuts]
+    ends = [*cuts, len(parts)]
+    return [" ".join(parts[start:end]) for start, end in zip(starts, ends) if start < end]
+
+
+
+def _channel_tldr_line(
+    summary: str,
+    status: TaskStatus,
+    error: Optional[str] = None,
+) -> str:
+    """One public-safe headline for the parent channel. Not a receipt dump."""
+
+    from agent_discord.puppetmaster.backend import public_card_text, usable_worker_text
+
+    raw = public_card_text(summary or "") or ""
+    if not raw and error:
+        raw = public_card_text(error) or usable_worker_text(error)
+    if not raw:
+        raw = usable_worker_text(summary or "")
+    first = next((ln.strip() for ln in (raw or "").splitlines() if ln.strip()), "")
+    line = " ".join(first.split())
+    if not line:
+        if status == TaskStatus.FAILED:
+            return "Couldn't finish."
+        if status == TaskStatus.CANCELLED:
+            return "Cancelled."
+        return "Done."
+    for end in (".", "!", "?"):
+        idx = line.find(end)
+        if 0 <= idx <= CHANNEL_TLDR_LIMIT:
+            line = line[: idx + 1].strip()
+            break
+    else:
+        if len(line) > CHANNEL_TLDR_LIMIT:
+            line = line[: CHANNEL_TLDR_LIMIT - 3].rstrip() + "..."
+    if line[-1:] not in ".!?":
+        line = line + "."
+    return line
+
+
 class _LiveCard:
     """One editable card. Persist-then-settle on beat change / Done."""
 
@@ -162,14 +265,15 @@ class _LiveCard:
         from agent_discord.puppetmaster.backend import public_card_text
 
         new_text = public_card_text(getattr(card, "description", "") or "")
+        prior = public_card_text(self.text)
         should = False
-        if self.thread_id and self.text:
+        if self.thread_id and prior and prior != new_text:
             if settle:
                 should = True
             elif stage and self.stage and stage != self.stage:
                 should = True
-        if should:
-            self.orch._settle_beat(self.channel_id, self.thread_id, self.text)
+        if should and _is_settle_worthy(prior):
+            self.orch._settle_beat(self.channel_id, self.thread_id, prior)
         self.message_id = self.orch._post_or_edit_progress(
             self.channel_id,
             card,
@@ -186,24 +290,35 @@ class _LiveCard:
 
         if self.orch.discord is None:
             return
-        if self.thread_id:
-            if _is_settle_worthy(self.text):
-                self.orch._settle_beat(self.channel_id, self.thread_id, self.text)
-            spoken = public_card_text(summary)
-            if (
-                spoken
-                and spoken != public_card_text(self.text)
-                and _is_settle_worthy(spoken)
-            ):
-                self.orch._settle_beat(self.channel_id, self.thread_id, spoken)
+        spoken = public_card_text(summary) or public_card_text(
+            getattr(card, "description", "") or ""
+        )
+        prior = public_card_text(self.text)
+        # Settle only a previous different user-facing beat. Never reprint Done.
+        if (
+            self.thread_id
+            and prior
+            and spoken
+            and prior != spoken
+            and _is_settle_worthy(prior)
+        ):
+            self.orch._settle_beat(self.channel_id, self.thread_id, prior)
+        bubbles = _settle_bubbles(spoken) if spoken else []
+        extras = bubbles[1:]
+        first = bubbles[0] if bubbles else spoken
+        card_body = public_card_text(getattr(card, "description", "") or "")
+        if first and card_body == spoken:
+            card = replace(card, description=first)
         dest = self.thread_id or self.channel_id
         if self.message_id:
             try:
                 edit_card(self.orch.discord, dest, self.message_id, card)
-                return
             except Exception:
-                pass
-        send_card(self.orch.discord, self.channel_id, card, thread_id=self.thread_id)
+                send_card(self.orch.discord, self.channel_id, card, thread_id=self.thread_id)
+        else:
+            send_card(self.orch.discord, self.channel_id, card, thread_id=self.thread_id)
+        if extras and self.thread_id:
+            self.orch._post_settle_messages(self.channel_id, self.thread_id, extras)
 
 
 class AgentOrchestrator:
@@ -241,6 +356,11 @@ class AgentOrchestrator:
         self.presence = presence
         self._run_status: dict[str, TaskStatus] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
+        self._tldr_posted: set[str] = set()
+        self._steer_lock = threading.Lock()
+        self._live_threads: dict[str, str] = {}
+        self._steer_inbox: dict[str, list[str]] = {}
+        self.steer_count = 0
 
     def run_task(self, intake: TaskIntake) -> RunReceipt:
         pin = self.backend.resolve_model(self.model)
@@ -300,6 +420,7 @@ class AgentOrchestrator:
             from agent_discord.orchestration.jobs import note_origin_thread
 
             note_origin_thread(job_thread_id)
+            self._mark_thread_live(job_thread_id, run_id)
         live = _LiveCard(self, intake.channel_id, job_thread_id, run_id)
         if self.post_progress_to_discord and self.discord is not None:
             live.paint(
@@ -311,6 +432,7 @@ class AgentOrchestrator:
                 ),
                 stage="start",
             )
+        self._react_intake(intake, "\U0001F440")
 
         if intake.message_id:
             self.store.bind_inbound_message(
@@ -470,13 +592,15 @@ class AgentOrchestrator:
         from agent_discord.host.github import is_github_unauthed_report
 
         if is_github_status_ask(intake.text) and is_github_unauthed_report(host_github):
-            return self._close_without_worker(
+            receipt = self._close_without_worker(
                 intake,
                 task_id=task_id,
                 run_id=run_id,
                 summary=host_github,
                 live=live,
             )
+            self._release_live_thread(job_thread_id, run_id)
+            return receipt
         extra_meta["host_reach"] = "\n\n".join(
             item
             for item in (
@@ -491,11 +615,13 @@ class AgentOrchestrator:
             from agent_discord.orchestration.service import writes_need_approval
 
             if writes_need_approval(self.store):
-                return self._park_for_approval(
+                receipt = self._park_for_approval(
                     intake,
                     task_id=task_id,
                     run_id=run_id,
                 )
+                self._release_live_thread(job_thread_id, run_id)
+                return receipt
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
@@ -504,10 +630,13 @@ class AgentOrchestrator:
             context=snapshot,
             metadata=extra_meta,
         )
-        if host_github and not is_github_unauthed_report(host_github):
+        prefer_host_report = bool(host_github) and not is_github_unauthed_report(
+            host_github
+        )
+        if prefer_host_report:
             from agent_discord.puppetmaster.backend import public_card_text
 
-            shown = public_card_text(host_github[:TOKEN_TEXT_LIMIT])
+            shown = public_card_text(host_github)
             if shown:
                 live.paint(
                     progress_card(
@@ -538,7 +667,13 @@ class AgentOrchestrator:
             result = self.backend.dispatch(request)
             events_iter = iter(result.events)
 
-        token_text = host_github[-TOKEN_TEXT_LIMIT:] if host_github else ""
+        from agent_discord.puppetmaster.backend import public_card_text as _card_text
+
+        token_text = (
+            _card_text(host_github)
+            if prefer_host_report
+            else (host_github[-TOKEN_TEXT_LIMIT:] if host_github else "")
+        )
         token_dirty = bool(token_text)
         last_flush_at = _monotonic()
         last_percent: Optional[float] = None
@@ -584,6 +719,11 @@ class AgentOrchestrator:
                 painted_live = True
 
         for event in events_iter:
+            incoming = self._take_steers(run_id)
+            if incoming:
+                add = "\n".join(incoming)
+                token_text = (token_text + "\n\n" + add).strip()[-TOKEN_TEXT_LIMIT:]
+                token_dirty = True
             safe_details = strip_forbidden_keys(dict(event.summary.details))
             if not isinstance(safe_details, dict):
                 safe_details = {}
@@ -617,6 +757,8 @@ class AgentOrchestrator:
                 and self.discord is not None
                 and event.kind in {EventKind.PROGRESS, EventKind.DISPATCH}
             ):
+                if prefer_host_report:
+                    continue
                 if summary.percent is not None:
                     last_percent = summary.percent
                 if (summary.message or "").strip().lower().startswith("dispatched via"):
@@ -737,28 +879,29 @@ class AgentOrchestrator:
             self._record_usage_spend(intake.workspace_id, run_id, result.usage)
 
         from agent_discord.puppetmaster.backend import choose_spoken_answer
+        from agent_discord.puppetmaster.backend import public_card_text
 
         progress_bits = tuple(
             item.message
             for item in progress_items
             if item.stage in {"thinking", "plan", "code", "done"}
         )
-        spoken = choose_spoken_answer(
-            token_text,
-            *reversed(progress_bits),
-            result.final_summary,
-        )
-        if not spoken:
-            from agent_discord.host.github import is_github_unauthed_report
-            from agent_discord.puppetmaster.backend import public_card_text
-
-            spoken = public_card_text(token_text)
-            if (
-                not spoken
-                and is_github_status_ask(intake.text)
-                and is_github_unauthed_report(host_github)
-            ):
-                spoken = host_github
+        if prefer_host_report:
+            spoken = public_card_text(host_github) or host_github.strip()
+        else:
+            spoken = choose_spoken_answer(
+                token_text,
+                *reversed(progress_bits),
+                result.final_summary,
+            )
+            if not spoken:
+                spoken = public_card_text(token_text)
+                if (
+                    not spoken
+                    and is_github_status_ask(intake.text)
+                    and is_github_unauthed_report(host_github)
+                ):
+                    spoken = host_github
         safe_final_summary = spoken or "Worker finished without a written answer."
         safe_error = redact_text_markers(result.error) if result.error else None
         self.store.update_run(
@@ -815,10 +958,17 @@ class AgentOrchestrator:
 
         if self.post_progress_to_discord and self.discord is not None:
             live.finish(card, summary=safe_final_summary)
-        if live.thread_id:
-            from agent_discord.orchestration.jobs import drop_origin_thread
-
-            drop_origin_thread(live.thread_id)
+        self._release_live_thread(live.thread_id or job_thread_id, run_id)
+        self._react_terminal(intake, result.status)
+        self._post_channel_tldr(
+            intake,
+            run_id=run_id,
+            task_id=task_id,
+            status=result.status,
+            summary=safe_final_summary,
+            thread_id=live.thread_id,
+            error=safe_error,
+        )
         self._set_presence("idle", "Discord OS")
 
         return receipt
@@ -916,6 +1066,17 @@ class AgentOrchestrator:
             "swarm receipt",
             {"workers": len(roles), "roles": roles},
             source="orchestrator",
+        )
+        self._release_live_thread(live.thread_id or job_thread_id, run_id)
+        self._react_terminal(intake, final_status)
+        self._post_channel_tldr(
+            intake,
+            run_id=run_id,
+            task_id=task_id,
+            status=final_status,
+            summary=redact_text_markers(stitched),
+            thread_id=live.thread_id,
+            error=handoff_error,
         )
         self._set_presence("idle", "Discord OS")
         return receipt
@@ -1308,23 +1469,39 @@ class AgentOrchestrator:
     ) -> None:
         if self.discord is None or not thread_id:
             return
-        from agent_discord.puppetmaster.backend import public_card_text
+        bubbles = _settle_bubbles(text)
+        if not bubbles:
+            return
+        self._post_settle_messages(channel_id, thread_id, bubbles)
 
-        body = public_card_text(text).strip()
-        if not _is_settle_worthy(body):
+    def _post_settle_messages(
+        self,
+        channel_id: str,
+        thread_id: Optional[str],
+        bodies: list[str],
+    ) -> None:
+        """Best-effort thread bubbles. A follow-up failure keeps the first."""
+
+        if self.discord is None or not thread_id:
             return
         poster = getattr(self.discord, "send_message", None)
         if not callable(poster):
             return
-        try:
-            poster(channel_id, body, thread_id=thread_id)
-        except TypeError:
+        posted = 0
+        for body in bodies:
+            text = (body or "").strip()
+            if not text or not _is_settle_worthy(text):
+                continue
             try:
-                poster(channel_id, body)
+                try:
+                    poster(channel_id, text, thread_id=thread_id)
+                except TypeError:
+                    poster(channel_id, text)
             except Exception:
                 return
-        except Exception:
-            return
+            posted += 1
+            if posted >= SETTLE_MAX_BUBBLES:
+                return
 
     def _close_without_worker(
         self,
@@ -1351,8 +1528,84 @@ class AgentOrchestrator:
         )
         if self.post_progress_to_discord and self.discord is not None:
             live.finish(receipt_card(receipt), summary=spoken)
+        self._react_terminal(intake, TaskStatus.COMPLETED)
+        self._post_channel_tldr(
+            intake,
+            run_id=run_id,
+            task_id=task_id,
+            status=TaskStatus.COMPLETED,
+            summary=spoken,
+            thread_id=live.thread_id,
+        )
         self._set_presence("idle", "Discord OS")
         return receipt
+
+    def _react_intake(self, intake: TaskIntake, emoji: str) -> None:
+        if self.discord is None or not intake.message_id or not intake.channel_id:
+            return
+        adder = getattr(self.discord, "add_reaction", None)
+        if not callable(adder):
+            return
+        try:
+            adder(intake.channel_id, intake.message_id, emoji)
+        except Exception:
+            pass
+
+    def _react_terminal(self, intake: TaskIntake, status: TaskStatus) -> None:
+        if status == TaskStatus.COMPLETED:
+            self._react_intake(intake, "\u2705")
+        elif status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            self._react_intake(intake, "\u274c")
+
+    def _post_channel_tldr(
+        self,
+        intake: TaskIntake,
+        *,
+        run_id: str,
+        task_id: str,
+        status: TaskStatus,
+        summary: str,
+        thread_id: Optional[str],
+        error: Optional[str] = None,
+    ) -> None:
+        """Best-effort parent-channel headline. Never fail the job."""
+
+        if self.discord is None or not intake.channel_id or not thread_id:
+            return
+        if not run_id or run_id in self._tldr_posted:
+            return
+        try:
+            events = self.store.list_events(run_id)
+        except Exception:
+            events = ()
+        if any(
+            "channel_tldr" in str(item.get("summary") or "")
+            for item in events
+        ):
+            self._tldr_posted.add(run_id)
+            return
+        line = _channel_tldr_line(summary, status, error)
+        if not line:
+            return
+        self._tldr_posted.add(run_id)
+        poster = getattr(self.discord, "send_message", None)
+        if not callable(poster):
+            return
+        try:
+            poster(intake.channel_id, line)
+        except Exception:
+            return
+        try:
+            self._event(
+                task_id,
+                run_id,
+                EventKind.STATUS,
+                "channel_tldr",
+                {"channel_id": intake.channel_id, "line": line[:200]},
+                source="orchestrator",
+            )
+        except Exception:
+            return
 
     def _start_job_thread(
         self,
@@ -1395,6 +1648,71 @@ class AgentOrchestrator:
         if posted is not None:
             return getattr(posted, "message_id", None) or message_id
         return message_id
+
+    def running_run_for_thread(self, thread_id: str) -> Optional[str]:
+        """Return the live run_id for a Discord thread, if one is cooking."""
+
+        tid = (thread_id or "").strip()
+        if not tid:
+            return None
+        with self._steer_lock:
+            return self._live_threads.get(tid)
+
+    def steer(self, run_id: str, text: str) -> bool:
+        """Append user text to a running worker. No sibling job, no second card."""
+
+        rid = (run_id or "").strip()
+        body = (text or "").strip()
+        if not rid or not body:
+            return False
+        with self._steer_lock:
+            live = rid in self._live_threads.values()
+            status = self._run_status.get(rid)
+        if not live and status != TaskStatus.RUNNING:
+            return False
+        if status not in (None, TaskStatus.RUNNING, TaskStatus.PROGRESS, TaskStatus.PENDING):
+            return False
+        with self._steer_lock:
+            self._steer_inbox.setdefault(rid, []).append(body)
+            self.steer_count += 1
+        hook = getattr(self.backend, "steer", None)
+        if callable(hook):
+            try:
+                hook(rid, body)
+            except Exception:
+                pass
+        return True
+
+    def _mark_thread_live(self, thread_id: Optional[str], run_id: str) -> None:
+        tid = (thread_id or "").strip()
+        rid = (run_id or "").strip()
+        if not tid or not rid:
+            return
+        with self._steer_lock:
+            self._live_threads[tid] = rid
+
+    def _release_live_thread(self, thread_id: Optional[str], run_id: str) -> None:
+        tid = (thread_id or "").strip()
+        rid = (run_id or "").strip()
+        with self._steer_lock:
+            if tid and self._live_threads.get(tid) == rid:
+                self._live_threads.pop(tid, None)
+            elif rid:
+                for key, value in list(self._live_threads.items()):
+                    if value == rid:
+                        self._live_threads.pop(key, None)
+            self._steer_inbox.pop(rid, None)
+        if tid:
+            from agent_discord.orchestration.jobs import drop_origin_thread
+
+            drop_origin_thread(tid)
+
+    def _take_steers(self, run_id: str) -> list[str]:
+        rid = (run_id or "").strip()
+        if not rid:
+            return []
+        with self._steer_lock:
+            return list(self._steer_inbox.pop(rid, []))
 
     def cancel(self, run_id: str) -> bool:
         ok = bool(self.backend.cancel(run_id))

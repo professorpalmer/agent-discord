@@ -8,7 +8,7 @@ Cap is 8 live jobs.
 
 ## Listen path
 
-`drain_inbound` persists the watermark, then `JobPool.submit`. `--once` waits the pool. The host loop reaps finished receipts without blocking the next channel.
+`drain_inbound` persists the watermark, then `JobPool.submit`. An inbound message in a live job thread calls `orchestrator.steer` (append to the running worker) instead of submitting a sibling. Idle-thread follow-ups still start a new job in that thread. `--once` waits the pool. The host loop reaps finished receipts without blocking the next channel.
 
 ## Code
 

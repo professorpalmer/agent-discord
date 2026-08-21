@@ -32,6 +32,8 @@ class FakePuppetmasterBackend:
     last_requests: list[DispatchRequest] = field(default_factory=list)
     dispatch_count: int = 0
     artifact_files: list[str] = field(default_factory=list)
+    steer_count: int = 0
+    steers: list[tuple[str, str]] = field(default_factory=list)
 
     def resolve_model(self, requested: str) -> ModelPin:
         self.pin.assert_allowed(requested)
@@ -152,6 +154,15 @@ class FakePuppetmasterBackend:
                 )
             )
         return out
+
+    def steer(self, run_id: str, text: str) -> None:
+        """Append follow-up text to a live fake worker."""
+
+        body = (text or "").strip()
+        if not run_id or not body:
+            return
+        self.steers.append((run_id, body))
+        self.steer_count += 1
 
     def cancel(self, run_id: str) -> bool:
         self.cancelled.add(run_id)

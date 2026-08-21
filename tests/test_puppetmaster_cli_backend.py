@@ -442,3 +442,51 @@ def test_agentic_stream_passes_json_lines_and_parses_tokens(monkeypatch, tmp_pat
     assert "--emit-job-id-early" in worker
     assert worker[worker.index("--worker-mode") + 1] == "inline"
     assert any(event.summary.details.get("token") for event in events)
+
+
+def test_public_card_text_strips_inline_cary_blob():
+    from agent_discord.puppetmaster.backend import public_card_text
+
+    blob = (
+        "ollow the first turn requirement - make a tool call first. "
+        "Let me quickly verify context by examining the repo. "
+        "Actually the requirement says to answer from the host output. "
+        "But I must call submit_findings at the end, and first response must include a tool call. "
+        "Here's the answer for Discord: all clear. Open PRs: none. "
+        "(These are the live GitHub numbers as queried on your Mac just"
+    )
+    kept = public_card_text(blob)
+    assert "all clear" in kept
+    assert "Open PRs: none" in kept
+    assert "on your Mac just" not in kept
+    lower = kept.lower()
+    assert "tool call" not in lower
+    assert "first turn" not in lower
+    assert "submit_findings" not in lower
+    assert "here's the answer for discord" not in lower
+    assert "requirement says" not in lower
+
+
+def test_public_card_text_dedups_repeated_paragraph():
+    from agent_discord.puppetmaster.backend import public_card_text
+
+    blob = (
+        "Here's the answer for Discord: all clear. Open PRs: none.\n\n"
+        "Here's the answer for Discord: all clear. Open PRs: none."
+    )
+    kept = public_card_text(blob)
+    assert kept.count("all clear") == 1
+    assert kept.count("Open PRs: none") == 1
+    assert "Here's the answer for Discord" not in kept
+
+
+def test_usable_worker_text_clips_at_sentence_boundary():
+    from agent_discord.puppetmaster.backend import RECEIPT_TEXT_LIMIT, usable_worker_text
+
+    text = " ".join(f"Sentence number {i} is complete." for i in range(80))
+    text = text + " These are the live GitHub numbers as queried on your Mac just leftover"
+    assert len(text) > RECEIPT_TEXT_LIMIT
+    cleaned = usable_worker_text(text)
+    assert cleaned.endswith(".")
+    assert "on your Mac just" not in cleaned
+    assert "Sentence number 0 is complete." in cleaned

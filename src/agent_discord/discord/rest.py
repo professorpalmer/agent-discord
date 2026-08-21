@@ -11,7 +11,7 @@ import json
 import uuid
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from agent_discord.contracts import DiscordAttachment, DiscordMessage
@@ -158,6 +158,26 @@ def start_message_thread(
     if not thread_id:
         raise ToolInvocationError("Discord thread create missing id")
     return thread_id
+
+
+
+def add_message_reaction(
+    token: str,
+    channel_id: str,
+    message_id: str,
+    emoji: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+) -> None:
+    """PUT a reaction on a message. Empty body. Emoji is URL-encoded."""
+
+    encoded = quote(emoji, safe="")
+    call_discord_json(
+        token,
+        "PUT",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me",
+        opener=opener,
+    )
 
 
 def patch_bot_avatar(
