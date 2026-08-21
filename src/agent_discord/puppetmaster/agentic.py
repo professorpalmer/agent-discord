@@ -95,6 +95,10 @@ class AgenticPuppetmasterBackend:
 
         prompt = _safe_dispatch_prompt(request)
         workdir = str(self.cwd) if self.cwd else None
+        mode = str((request.metadata or {}).get("compute_mode") or "implement")
+        if mode not in {"implement", "analyze"}:
+            mode = "implement"
+        is_git = bool(workdir) and (Path(workdir) / ".git").exists()
         command = [
             self.cli,
             "agentic",
@@ -104,11 +108,16 @@ class AgenticPuppetmasterBackend:
             "--model",
             pin.adapter_name,
             "--mode",
-            "implement",
-            "--allow-dirty",
+            mode,
             "--timeout-seconds",
             str(int(self.timeout_seconds)),
         ]
+        if mode == "implement":
+            command.append("--allow-dirty")
+            if not is_git:
+                command.append("--allow-non-worktree")
+        elif not is_git:
+            command.extend(["--allow-non-worktree", "--disable-codegraph"])
         if workdir:
             command.extend(["--cwd", workdir])
 

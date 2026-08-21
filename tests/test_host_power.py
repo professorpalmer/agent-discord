@@ -99,9 +99,17 @@ def test_drain_off_swallows_tasks_on_dispatches(tmp_path: Path):
     assert len(receipts) == 1
     assert "run this after on" in (receipts[0].summary or "")
     assert store.host_is_armed("ch") is True
-    cards = [msg.content for msg in fake.sent if (msg.content or "").startswith("**Card** HOST")]
-    assert cards
-    assert "Power: `on`" in cards[-1]
+    def _host_title(msg) -> str:
+        for row in (msg.metadata or {}).get("components") or []:
+            for item in row.get("components") or []:
+                text = item.get("content") or ""
+                if text.startswith("### "):
+                    return text.splitlines()[0][4:]
+        return ""
+
+    host_cards = [msg for msg in fake.sent if _host_title(msg) in {"Running", "Stopped"}]
+    assert host_cards
+    assert _host_title(host_cards[-1]) == "Running"
     store.close()
 
 
@@ -134,9 +142,17 @@ def test_host_card_edits_in_place(tmp_path: Path):
         workspace=tmp_path,
     )
     drain_inbound(orch, facade, channel_id="ch", workspace_id="ws", since_ms=now_ms)
-    host_cards = [msg for msg in fake.sent if (msg.content or "").startswith("**Card** HOST")]
+    def _host_title(msg) -> str:
+        for row in (msg.metadata or {}).get("components") or []:
+            for item in row.get("components") or []:
+                text = item.get("content") or ""
+                if text.startswith("### "):
+                    return text.splitlines()[0][4:]
+        return ""
+
+    host_cards = [msg for msg in fake.sent if _host_title(msg) in {"Running", "Stopped"}]
     assert len(host_cards) == 1
-    assert "Power: `on`" in host_cards[0].content
+    assert _host_title(host_cards[0]) == "Running"
     store.close()
 
 

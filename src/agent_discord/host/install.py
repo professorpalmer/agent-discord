@@ -60,6 +60,8 @@ def render_launchd_plist(
         "  <dict>\n"
         f"    <key>{SERVICE_ENV}</key>\n"
         "    <string>1</string>\n"
+        "    <key>PYTHONUNBUFFERED</key>\n"
+        "    <string>1</string>\n"
         "    <key>AGENT_DISCORD_WORKSPACE</key>\n"
         f"    <string>{_xml(str(workspace))}</string>\n"
         "  </dict>\n"

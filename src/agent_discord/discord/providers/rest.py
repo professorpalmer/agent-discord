@@ -51,6 +51,8 @@ class RestDiscordProvider:
         *,
         thread_id: Optional[str] = None,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         return send_channel_message(
             token=self._bot_token,
@@ -58,6 +60,8 @@ class RestDiscordProvider:
             content=content,
             thread_id=thread_id,
             components=components,
+            embeds=embeds,
+            flags=flags,
             opener=self._opener,
         )
 
@@ -92,6 +96,9 @@ class RestDiscordProvider:
         *,
         content: str = "",
         thread_id: Optional[str] = None,
+        embeds: Optional[list] = None,
+        components: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         return send_channel_attachment(
             token=self._bot_token,
@@ -100,6 +107,9 @@ class RestDiscordProvider:
             data=data,
             content=content,
             thread_id=thread_id,
+            embeds=embeds,
+            components=components,
+            flags=flags,
             opener=self._opener,
         )
 
@@ -132,6 +142,8 @@ class RestDiscordProvider:
         content: str,
         *,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         return edit_channel_message(
             token=self._bot_token,
@@ -139,6 +151,24 @@ class RestDiscordProvider:
             message_id=message_id,
             content=content,
             components=components,
+            embeds=embeds,
+            flags=flags,
+            opener=self._opener,
+        )
+
+    def start_thread_from_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        name: str,
+    ) -> str:
+        from agent_discord.discord.rest import start_message_thread
+
+        return start_message_thread(
+            token=self._bot_token,
+            channel_id=channel_id,
+            message_id=message_id,
+            name=name,
             opener=self._opener,
         )
 

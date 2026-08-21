@@ -129,8 +129,14 @@ def test_listen_open_does_not_dispatch_implement(tmp_path: Path):
     assert receipts == []
     assert backend.dispatch_count == 0
     assert calls
-    cards = [m.content for m in fake.sent]
-    assert any(c.startswith(f"{CARD_PREFIX} OPEN") for c in cards)
+    texts = "\n".join(
+        item.get("content") or ""
+        for m in fake.sent
+        for row in ((m.metadata or {}).get("components") or [])
+        for item in row.get("components") or []
+        if item.get("type") == 10
+    )
+    assert "### Opened" in texts
     store.close()
 
 
@@ -172,4 +178,4 @@ def test_handle_open_message_rejects_escape(tmp_path: Path):
     )
     assert result.opened is False
     assert "outside" in result.error
-    assert result.card.startswith(f"{CARD_PREFIX} OPEN")
+    assert result.card.startswith("Could not open")

@@ -38,6 +38,7 @@ class FakeDiscordMCPProvider:
     fail_tools: set[str] = field(default_factory=set)
     sampling_calls: list[Mapping[str, Any]] = field(default_factory=list)
     blobs: dict[str, bytes] = field(default_factory=dict)
+    threads: dict[str, dict[str, str]] = field(default_factory=dict)
     persist_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
@@ -149,10 +150,16 @@ class FakeDiscordMCPProvider:
         *,
         thread_id: Optional[str] = None,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         meta = {"provider": self.name}
         if components:
             meta["components"] = list(components)
+        if embeds:
+            meta["embeds"] = list(embeds)
+        if flags:
+            meta["flags"] = int(flags)
         msg = DiscordMessage(
             channel_id=channel_id,
             content=content,
@@ -172,6 +179,9 @@ class FakeDiscordMCPProvider:
         *,
         content: str = "",
         thread_id: Optional[str] = None,
+        embeds: Optional[list] = None,
+        components: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         attachment_id = f"att-{uuid4().hex[:10]}"
         payload = bytes(data)
@@ -181,17 +191,38 @@ class FakeDiscordMCPProvider:
             filename=filename,
             size=len(payload),
         )
+        meta: dict[str, Any] = {
+            "provider": self.name,
+            "embeds": list(embeds or []),
+            "components": list(components or []),
+        }
+        if flags:
+            meta["flags"] = int(flags)
         msg = DiscordMessage(
             channel_id=channel_id,
             content=content,
             message_id=f"fake-{uuid4().hex[:10]}",
             thread_id=thread_id,
             attachments=(att,),
-            metadata={"provider": self.name},
+            metadata=meta,
         )
         self.sent.append(msg)
         self._save_persist()
         return msg
+
+    def start_thread_from_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        name: str,
+    ) -> str:
+        thread_id = f"thread-{message_id}"
+        self.threads[thread_id] = {
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "name": (name or "job")[:100],
+        }
+        return thread_id
 
     def get_message(self, channel_id: str, message_id: str) -> DiscordMessage:
         for msg in (*self.sent, *self.inbox):
@@ -206,6 +237,8 @@ class FakeDiscordMCPProvider:
         content: str,
         *,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         if "edit_message" in self.fail_tools:
             raise ToolInvocationError("forced failure")
@@ -216,6 +249,10 @@ class FakeDiscordMCPProvider:
                 meta = dict(msg.metadata)
                 if components is not None:
                     meta["components"] = list(components)
+                if embeds is not None:
+                    meta["embeds"] = list(embeds)
+                if flags:
+                    meta["flags"] = int(flags)
                 updated = DiscordMessage(
                     channel_id=msg.channel_id or channel_id,
                     content=content,

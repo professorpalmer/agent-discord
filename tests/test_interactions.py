@@ -86,7 +86,7 @@ def test_handle_ping_and_open_and_connect(tmp_path: Path):
         runner=runner,
     )
     assert opened
-    assert open_reply["data"]["content"].startswith(f"{CARD_PREFIX} OPEN")
+    assert open_reply["data"]["content"].startswith("Opened")
     assert open_reply["data"]["flags"] == 64
 
     connect_reply = handle_interaction_payload(
@@ -95,7 +95,7 @@ def test_handle_ping_and_open_and_connect(tmp_path: Path):
         roots=[tmp_path],
     )
     content = connect_reply["data"]["content"]
-    assert content.startswith(f"{CARD_PREFIX} CONNECT")
+    assert content.startswith("Connected") or content.startswith("Finish on the host")
     assert "sk-" not in content.lower()
 
 

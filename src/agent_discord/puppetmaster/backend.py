@@ -247,6 +247,22 @@ _SAFE_SUMMARY_KEYS = frozenset(
 )
 
 
+_SUMMARY_SKIP_PREFIXES = ("#", "---", "goal:", "role:", "status:")
+
+
+def _first_visible_summary_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        lower = raw.lower()
+        if any(lower.startswith(prefix) for prefix in _SUMMARY_SKIP_PREFIXES):
+            continue
+        return raw[:500]
+    first = (text or "").strip().splitlines()
+    return first[0][:500] if first else "completed"
+
+
 def _parse_safe_cli_completion(stdout: str, stderr: str) -> dict[str, Any]:
     """Extract only safe structured completion fields; never relay hidden reasoning."""
     meta: dict[str, Any] = {}
@@ -296,9 +312,7 @@ def _parse_safe_cli_completion(stdout: str, stderr: str) -> dict[str, Any]:
                             if key == "summary":
                                 break
             elif text.strip():
-                # Plain summary files: take a short preview only
-                preview = text.strip().splitlines()[0][:500]
-                meta["summary"] = preview
+                meta["summary"] = _first_visible_summary_line(text)
 
     if "summary" not in meta:
         if meta.get("job_id"):
