@@ -285,3 +285,25 @@ def test_pair_and_halt_buttons_parse(tmp_path: Path):
     assert halt == "halt"
     assert store.get_preference("_host", "spend_halt") == "1"
     store.close()
+
+
+def test_store_usable_from_another_thread(tmp_path: Path):
+    import threading
+
+    store = SQLiteStore(tmp_path / "thread.sqlite3")
+    store.initialize()
+    errors: list[str] = []
+
+    def worker() -> None:
+        try:
+            store.add_operator("u-thread", role="owner")
+            assert store.is_operator("u-thread")
+        except Exception as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert errors == []
+    assert store.is_operator("u-thread")
+    store.close()

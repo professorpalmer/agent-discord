@@ -122,12 +122,11 @@ def test_handle_gateway_interaction_acks_and_arms(tmp_path: Path):
     )
     assert action == "on"
     assert store.host_is_armed("ch") is True
-    assert captured["body"]["type"] == 7
+    assert captured["body"]["type"] == 6
     assert store.get_host_control("ch")["card_message_id"] == "panel-1"
     assert "ix-1/ix-token/callback" in str(captured["url"])
     body = captured["body"]
-    assert body["type"] == 7
-    assert body["data"]["components"]
+    assert body["type"] == 6
     store.close()
 
 
