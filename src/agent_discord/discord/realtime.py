@@ -9,11 +9,13 @@ from typing import Any, Callable, Optional
 from urllib.request import Request, urlopen
 
 from agent_discord.discord.errors import ToolInvocationError
+from agent_discord.discord.layout import presence_update
 from agent_discord.discord.rest import DISCORD_API_BASE, USER_AGENT
 from agent_discord.discord.ws import WebSocketClient, WebSocketError
 
 
 DispatchHandler = Callable[[str, dict[str, Any]], None]
+PresenceSender = Callable[[str, str], None]
 JsonSocket = Any
 
 INTENTS_GUILDS = 1
@@ -55,6 +57,9 @@ def run_discord_gateway(
     connect: Optional[Callable[[str], JsonSocket]] = None,
     gateway_url: Optional[str] = None,
     heartbeat_scale: float = 0.9,
+    on_connected: Optional[Callable[[PresenceSender], None]] = None,
+    presence_status: str = "idle",
+    presence_name: str = "Discord OS",
 ) -> None:
     """Identify, heartbeat, and forward DISPATCH events until stop or fatal close.
 
@@ -116,6 +121,10 @@ def run_discord_gateway(
                                 "browser": "discord-os",
                                 "device": "discord-os",
                             },
+                            "presence": presence_update(
+                                status=presence_status,
+                                name=presence_name,
+                            )["d"],
                         },
                     }
                 )
@@ -125,6 +134,19 @@ def run_discord_gateway(
             if op == 0:
                 event = str(message.get("t") or "")
                 payload = data if isinstance(data, dict) else {}
+                if event == "READY":
+                    print("panel gateway ready", flush=True)
+                    if on_connected is not None:
+                        def _set_presence(status: str, name: str) -> None:
+                            try:
+                                send(presence_update(status=status, name=name))
+                            except Exception:
+                                pass
+
+                        try:
+                            on_connected(_set_presence)
+                        except Exception:
+                            pass
                 try:
                     on_dispatch(event, payload)
                 except Exception:

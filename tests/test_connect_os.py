@@ -118,9 +118,19 @@ def test_shred_intercept_deletes_and_does_not_dispatch(tmp_path: Path):
     )
     assert receipts == []
     assert all(m.message_id != "conn-1" for m in fake.inbox)
-    cards = [m.content for m in fake.sent]
-    assert any(c.startswith(f"{CARD_PREFIX} CONNECT") for c in cards)
-    assert all(FAKE_KEY not in c for c in cards)
+    texts = "\n".join(
+        item.get("content") or ""
+        for m in fake.sent
+        for row in ((m.metadata or {}).get("components") or [])
+        for item in row.get("components") or []
+        if item.get("type") == 10
+    )
+    assert "### Connected" in texts
+    assert all(FAKE_KEY not in (m.content or "") for m in fake.sent)
+    assert all(
+        FAKE_KEY not in json.dumps(m.metadata)
+        for m in fake.sent
+    )
     vault = KeyVault(tmp_path / "keys")
     assert vault.fingerprint("openrouter") == "wxyz"
     assert vault.get("openrouter") == FAKE_KEY
@@ -239,7 +249,7 @@ def test_inherit_connect_message_uses_env(tmp_path: Path):
     assert result.source == "env"
     assert result.fingerprint == "wxyz"
     assert FAKE_KEY not in result.card
-    assert result.card.startswith(f"{CARD_PREFIX} CONNECT")
+    assert result.card.startswith("Connected")
 
 
 def _snowflake_at(created_ms: int) -> str:
@@ -552,6 +562,31 @@ def test_should_dispatch_skips_cards():
     assert not should_dispatch_inbound(
         DiscordMessage(channel_id="ch", content=f"{CARD_PREFIX} OPEN\nSurface: `terminal`")
     )
+    assert not should_dispatch_inbound(
+        DiscordMessage(
+            channel_id="ch",
+            content="",
+            metadata={
+                "embeds": [{"title": "Stopped", "footer": {"text": "Discord OS"}}]
+            },
+        )
+    )
+    assert not should_dispatch_inbound(
+        DiscordMessage(
+            channel_id="ch",
+            content="",
+            metadata={
+                "components": [
+                    {
+                        "type": 17,
+                        "components": [
+                            {"type": 10, "content": "### Stopped\n-# Discord OS"}
+                        ],
+                    }
+                ]
+            },
+        )
+    )
     assert should_dispatch_inbound(
         DiscordMessage(channel_id="ch", content="please fix the login", message_id="m1")
     )
@@ -597,6 +632,7 @@ def test_agentic_backend_argv_and_env_never_on_argv(monkeypatch, tmp_path: Path)
     assert "--mode" in cmd
     assert cmd[cmd.index("--mode") + 1] == "implement"
     assert "--allow-dirty" in cmd
+    assert "--allow-non-worktree" in cmd
     assert "--timeout-seconds" in cmd
     assert "--cwd" in cmd
     assert FAKE_KEY not in cmd
@@ -605,6 +641,47 @@ def test_agentic_backend_argv_and_env_never_on_argv(monkeypatch, tmp_path: Path)
     assert env["OPENROUTER_API_KEY"] == FAKE_KEY
     assert result.usage is not None
     assert result.usage.model == AGENTIC_CANONICAL_MODEL
+
+
+def test_agentic_analyze_mode_skips_implement(monkeypatch, tmp_path: Path):
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": list(cmd)})
+
+        class Proc:
+            returncode = 0
+            stdout = "job_id: j-a\nsummary: Discord OS is the harness.\n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(
+        "agent_discord.puppetmaster.agentic.shutil.which",
+        lambda _: "/usr/bin/puppetmaster",
+    )
+    monkeypatch.setattr("agent_discord.puppetmaster.agentic.subprocess.run", fake_run)
+    backend = AgenticPuppetmasterBackend(
+        cli="puppetmaster",
+        pin=AGENTIC_MODEL_PIN,
+        cwd=tmp_path,
+        env={},
+    )
+    request = DispatchRequest(
+        task_id="t2",
+        run_id="r2",
+        prompt="what is Discord OS?",
+        model=AGENTIC_CANONICAL_MODEL,
+        context=ContextSnapshot(task_id="t2", memories=[], bindings={}),
+        metadata={"compute_mode": "analyze"},
+    )
+    result = backend.dispatch(request)
+    assert result.status == TaskStatus.COMPLETED
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--mode") + 1] == "analyze"
+    assert "--allow-dirty" not in cmd
+    assert "--allow-non-worktree" in cmd
+    assert "--disable-codegraph" in cmd
 
 
 def test_overflow_pointer_has_no_url_key(tmp_path: Path):

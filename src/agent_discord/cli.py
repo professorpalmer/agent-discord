@@ -10,10 +10,11 @@ import shutil
 import sys
 import threading
 import time
+from queue import Empty, Queue
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterator, Optional, Sequence, TextIO
+from typing import Any, Iterator, Optional, Sequence, TextIO
 from uuid import uuid4
 
 from agent_discord import CLI_NAME, CLI_OWNER_PREFIX, PRODUCT_NAME, __version__
@@ -807,6 +808,7 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     exit_code = 0
     panel_stop = threading.Event()
     discord_down = threading.Event()
+    asks: Queue[str] = Queue()
     ignore_history_before_ms = int(time.time() * 1000) - LISTEN_HISTORY_SLACK_MS
     try:
         # Local process lock. Message intake stays REST. Host run opens a
@@ -839,27 +841,48 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                     channel_id=args.channel_id,
                     stop=panel_stop,
                     discord_down=discord_down,
+                    asks=asks,
                 )
         while True:
             if discord_down.is_set():
                 exit_code = 1
                 break
-            receipts = drain_inbound(
-                orch,
-                discord,
-                channel_id=args.channel_id,
-                workspace_id=args.workspace_id,
-                guild_id=args.guild_id,
-                thread_id=args.thread_id,
-                limit=args.limit,
-                workspace=config.workspace,
-                since_ms=ignore_history_before_ms,
-                host_roots=(
-                    (config.puppetmaster_cwd, config.workspace)
-                    if config.host_actions
-                    else ()
-                ),
+            receipts = list(
+                drain_inbound(
+                    orch,
+                    discord,
+                    channel_id=args.channel_id,
+                    workspace_id=args.workspace_id,
+                    guild_id=args.guild_id,
+                    thread_id=args.thread_id,
+                    limit=args.limit,
+                    workspace=config.workspace,
+                    since_ms=ignore_history_before_ms,
+                    host_roots=(
+                        (config.puppetmaster_cwd, config.workspace)
+                        if config.host_actions
+                        else ()
+                    ),
+                )
             )
+            while True:
+                try:
+                    prompt = asks.get_nowait()
+                except Empty:
+                    break
+                if not store.host_is_armed(args.channel_id):
+                    continue
+                receipts.append(
+                    orch.run_task(
+                        TaskIntake(
+                            text=prompt,
+                            channel_id=args.channel_id,
+                            workspace_id=args.workspace_id,
+                            guild_id=args.guild_id,
+                            thread_id=args.thread_id,
+                        )
+                    )
+                )
             if args.json:
                 print(
                     json.dumps(
@@ -911,21 +934,70 @@ def _start_panel_gateway(
     channel_id: str,
     stop: threading.Event,
     discord_down: threading.Event,
+    asks: Optional[Queue[str]] = None,
 ) -> None:
+    presence: list[Any] = []
+
+    def set_presence(armed: bool) -> None:
+        sender = presence[0] if presence else None
+        if sender is None:
+            return
+        if armed:
+            sender("dnd", "the harness")
+        else:
+            sender("idle", "Discord OS")
+
+    def on_ask(text: str) -> None:
+        if asks is not None and text.strip():
+            asks.put(text.strip())
+
+    def on_connected(sender: Any) -> None:
+        presence.clear()
+        presence.append(sender)
+        try:
+            set_presence(bool(store.host_is_armed(channel_id)))
+        except Exception:
+            sender("idle", "Discord OS")
+
     def on_dispatch(event: str, payload: dict) -> None:
         if event != "INTERACTION_CREATE":
             return
         from agent_discord.host.panel import handle_gateway_interaction
 
-        handle_gateway_interaction(store, channel_id, payload)
+        custom_id = ""
+        data = payload.get("data")
+        if isinstance(data, dict):
+            custom_id = str(data.get("custom_id") or "")
+        print(f"panel click {custom_id}", flush=True)
+        handle_gateway_interaction(
+            store,
+            channel_id,
+            payload,
+            token=token,
+            on_ask=on_ask,
+            on_power=set_presence,
+        )
 
     def loop() -> None:
         from agent_discord.discord.realtime import GatewayClosed, run_discord_gateway
 
+        armed = False
+        try:
+            armed = bool(store.host_is_armed(channel_id))
+        except Exception:
+            armed = False
         while not stop.is_set():
             try:
-                run_discord_gateway(token, on_dispatch, stop=stop)
+                run_discord_gateway(
+                    token,
+                    on_dispatch,
+                    stop=stop,
+                    on_connected=on_connected,
+                    presence_status="dnd" if armed else "idle",
+                    presence_name="the harness" if armed else "Discord OS",
+                )
             except GatewayClosed as exc:
+                print(f"panel gateway closed: {exc}", flush=True)
                 if exc.fatal:
                     try:
                         store.set_host_control(channel_id, armed=False)
@@ -933,7 +1005,7 @@ def _start_panel_gateway(
                         pass
                     discord_down.set()
                     return
-                time.sleep(2)
+                time.sleep(0.4)
             else:
                 return
 
@@ -1002,7 +1074,16 @@ def cmd_host_start(args: argparse.Namespace, *, out: TextIO | None = None) -> in
     (config.workspace / "logs").mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(config.database_path)
     store.initialize()
-    control =     store.set_host_control(args.channel_id, default_armed=False)
+    try:
+        from agent_discord.discord.rest import fetch_bot_identity
+        from agent_discord.host.brand import apply_bot_avatar
+
+        identity = fetch_bot_identity(token=config.discord_bot_token)
+        if not identity.get("avatar"):
+            apply_bot_avatar(config.discord_bot_token)
+    except Exception:
+        pass
+    control = store.set_host_control(args.channel_id, default_armed=False)
     installed = install_login_host(
         channel_id=args.channel_id,
         workspace=config.workspace,

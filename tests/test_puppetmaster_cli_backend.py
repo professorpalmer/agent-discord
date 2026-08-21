@@ -92,6 +92,16 @@ def test_parse_safe_cli_completion_strips_reasoning(tmp_path: Path):
     assert "chain_of_thought" not in meta
 
 
+def test_parse_skips_stitched_summary_heading(tmp_path: Path):
+    summary = tmp_path / "summary.md"
+    summary.write_text(
+        "# Puppetmaster Stitched Summary\n\nGoal: In one sentence: what is Discord OS?\n\nDiscord OS is the harness UI.\n",
+        encoding="utf-8",
+    )
+    meta = _parse_safe_cli_completion(f"job_id: j2\nsummary: {summary}\n", "")
+    assert meta["summary"] == "Discord OS is the harness UI."
+
+
 def test_dispatch_uses_cursor_subcommand(monkeypatch, tmp_path: Path):
     calls: list[dict[str, Any]] = []
 

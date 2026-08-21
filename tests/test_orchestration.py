@@ -51,6 +51,8 @@ def test_dispatch_persists_events_and_posts_receipt(tmp_path: Path):
     assert backend.last_request is not None
     assert backend.last_request.model == "cursor/grok-4-5"
     assert backend.last_request.context.memories
+    assert backend.last_request.metadata["compute_mode"] == "analyze"
+    assert fake_discord.threads
 
     events = store.list_events(receipt.run_id)
     kinds = [e["kind"] for e in events]
@@ -60,11 +62,20 @@ def test_dispatch_persists_events_and_posts_receipt(tmp_path: Path):
     assert "receipt" in kinds
 
     assert fake_discord.sent
-    assert any("Receipt" in m.content for m in fake_discord.sent)
+    assert any(
+        "### Done" in (item.get("content") or "")
+        or "Done" in (m.content or "")
+        for m in fake_discord.sent
+        for row in ((m.metadata or {}).get("components") or [])
+        for item in (row.get("components") or [row])
+    )
 
     rendered = render_receipt(receipt)
     assert "cursor/grok-4-5" in rendered or "grok-4.5" in rendered
     assert "chain_of_thought" not in rendered
+    jobs = store.list_recent_jobs("ch", limit=5)
+    assert jobs
+    assert jobs[0]["run_id"] == receipt.run_id
     store.close()
 
 

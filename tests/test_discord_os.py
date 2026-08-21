@@ -55,9 +55,16 @@ def test_put_get_roundtrip_bytes_and_sha256():
     assert msg.attachments[0].attachment_id == ref.attachment_id
     assert not hasattr(ref, "url")
     assert "url" not in asdict(ref)
-    caption = json.loads(fake.sent[-1].content)
-    assert caption["agent_discord_object"] == 1
-    assert caption["sha256"] == ref.sha256
+    posted = fake.sent[-1]
+    assert posted.content == ""
+    texts = "\n".join(
+        item.get("content") or ""
+        for row in (posted.metadata.get("components") or [])
+        for item in row.get("components") or []
+        if item.get("type") == 10
+    )
+    assert "### note.bin" in texts
+    assert "Discord OS" in texts
 
 
 def test_get_refuses_channel_id_mismatch():

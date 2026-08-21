@@ -46,15 +46,17 @@ Then one command:
 discord-os setup --channel-id YOUR_CHANNEL_ID
 ```
 
-That invites the bot (open the printed URL), installs a login helper so it comes back after reboot, and posts a HOST card in the channel with **On** and **Off** buttons. You do not type commands in Discord after this.
+That invites the bot (open the printed URL), installs a login helper so it comes back after reboot, and posts a HOST card in the channel with **On**, **Off**, and **Ask**. You do not type commands in Discord after this.
 
 ## 3. Use it from Discord
 
 | In Discord | What happens |
 |---|---|
 | **On** | Starts work on the host. Type a normal sentence as a task. |
-| **Off** | Stops work. The helper stays so On still works from your phone. |
-| a normal sentence | A task, only while On. |
+| **Ask** | Opens a prompt. Questions stay read-only. File work still edits. |
+| **Off** then **Confirm** | Stops work. Cancel keeps it running. The helper stays so On still works from your phone. |
+| Recent jobs | String select on the HOST card. Pick a run to see its receipt. |
+| a normal sentence | A task, only while On. Progress starts a thread; the receipt stays in that thread. |
 
 If Discord logs the bot out, work stops. The login helper starts again idle.
 
@@ -187,7 +189,21 @@ Slash chrome is **opt-in** and does not replace `listen`. Set `AGENT_DISCORD_INT
 | Cursor allowlist | **only** `cursor/grok-4-5` |
 | Agentic allowlist | **only** `openrouter/auto` |
 
-Requests for any other model raise an error. There is **no** silent remap. Cursor compute still invokes `puppetmaster cursor …`. Agentic compute invokes `puppetmaster agentic … --provider openrouter --mode implement`. Set `PUPPETMASTER_CWD` to control `--cwd`.
+Requests for any other model raise an error. There is **no** silent remap. Cursor compute still invokes `puppetmaster cursor …`. Agentic compute invokes `puppetmaster agentic … --provider openrouter --mode analyze` for questions, or `--mode implement --allow-dirty` for file work. Set `PUPPETMASTER_CWD` to control `--cwd`.
+
+### Bot look
+
+Developer Portal → Bot can set avatar and banner. If the bot has no avatar, `discord-os host start` uploads a local gold-bar mark once. Do not run SaseQ `discord-mcp` beside this host — one bot, one Gateway.
+
+### Screenshots
+
+![HOST card stopped, recent-jobs menu, and a Done receipt in #marionette-dev](docs/screenshots/discord-host.png)
+
+The mark used when the bot has no avatar:
+
+![Discord OS mark](docs/icon.png)
+
+Cards live in your staff channel. After setup, the HOST card is the dashboard: On / Off / Ask, a recent-jobs menu, and the bot thumbnail. Each task opens a thread.
 
 ### Optional Marionette backend
 

@@ -58,13 +58,40 @@ class DiscordFacade:
         thread_id: Optional[str] = None,
         chunk_limit: int = 2000,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> list[DiscordMessage]:
         """Send content, chunking as needed; return all posted messages."""
+        if flags or embeds:
+            kwargs: dict = {"thread_id": thread_id}
+            if embeds:
+                kwargs["embeds"] = embeds
+            if components is not None:
+                kwargs["components"] = components
+            if flags:
+                kwargs["flags"] = flags
+            try:
+                msg = self.provider.send_message(channel_id, content or "", **kwargs)
+            except TypeError:
+                fallback = content or _fallback_from_embeds(embeds)
+                try:
+                    msg = self.provider.send_message(
+                        channel_id,
+                        fallback,
+                        thread_id=thread_id,
+                        components=components,
+                    )
+                except TypeError:
+                    msg = self.provider.send_message(
+                        channel_id, fallback, thread_id=thread_id
+                    )
+            self._remember_outbound(msg)
+            return [msg]
         chunks = _chunks_for_inbound_skip(content, chunk_limit)
         posted: list[DiscordMessage] = []
         last = len(chunks) - 1
         for index, chunk in enumerate(chunks):
-            kwargs: dict = {"thread_id": thread_id}
+            kwargs = {"thread_id": thread_id}
             if components is not None and index == last:
                 kwargs["components"] = components
             try:
@@ -115,10 +142,25 @@ class DiscordFacade:
         *,
         content: str = "",
         thread_id: Optional[str] = None,
+        embeds: Optional[list] = None,
+        components: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
-        msg = self.provider.send_attachment(
-            channel_id, filename, data, content=content, thread_id=thread_id
-        )
+        try:
+            msg = self.provider.send_attachment(
+                channel_id,
+                filename,
+                data,
+                content=content,
+                thread_id=thread_id,
+                embeds=embeds,
+                components=components,
+                flags=flags,
+            )
+        except TypeError:
+            msg = self.provider.send_attachment(
+                channel_id, filename, data, content=content, thread_id=thread_id
+            )
         self._remember_outbound(msg)
         return msg
 
@@ -126,6 +168,17 @@ class DiscordFacade:
         """Fetch a message for a fresh attachment handle. Do not cache CDN URLs."""
 
         return self.provider.get_message(channel_id, message_id)
+
+    def start_thread_from_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        name: str,
+    ) -> str:
+        method = getattr(self.provider, "start_thread_from_message", None)
+        if callable(method):
+            return str(method(channel_id, message_id, name) or "")
+        raise ToolInvocationError("provider cannot start a thread")
 
     def download_attachment(
         self,
@@ -142,6 +195,8 @@ class DiscordFacade:
         content: str,
         *,
         components: Optional[list] = None,
+        embeds: Optional[list] = None,
+        flags: int = 0,
     ) -> DiscordMessage:
         method = getattr(self.provider, "edit_message", None)
         if callable(method):
@@ -151,9 +206,19 @@ class DiscordFacade:
                     message_id,
                     content,
                     components=components,
+                    embeds=embeds,
+                    flags=flags,
                 )
             except TypeError:
-                msg = method(channel_id, message_id, content)
+                try:
+                    msg = method(
+                        channel_id,
+                        message_id,
+                        content,
+                        components=components,
+                    )
+                except TypeError:
+                    msg = method(channel_id, message_id, content)
             self._remember_outbound(msg)
             return msg
         result = self._invoke_first(
@@ -232,6 +297,16 @@ class DiscordFacade:
     def _remember_outbound(self, msg: DiscordMessage) -> None:
         if msg.message_id:
             self._seen_message_ids.add(msg.message_id)
+
+
+def _fallback_from_embeds(embeds: list) -> str:
+    if not embeds or not isinstance(embeds[0], dict):
+        return ""
+    title = str(embeds[0].get("title") or "").strip()
+    description = str(embeds[0].get("description") or "").strip()
+    if title and description:
+        return f"{title}\n{description}"
+    return title or description
 
 
 def _chunks_for_inbound_skip(content: str, chunk_limit: int) -> list[str]:

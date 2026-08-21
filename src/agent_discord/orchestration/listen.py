@@ -15,7 +15,15 @@ from agent_discord.keys.connect import (
     is_connect_command,
     parse_connect_command,
 )
-from agent_discord.orchestration.cards import is_harness_card, render_host_card
+from agent_discord.orchestration.cards import (
+    connect_card,
+    edit_card,
+    host_card,
+    is_harness_card,
+    is_harness_message,
+    open_card,
+    send_card,
+)
 
 DISCORD_EPOCH_MS = 1_420_070_400_000
 LISTEN_HISTORY_SLACK_MS = 15_000
@@ -120,9 +128,19 @@ def should_dispatch_inbound(message: DiscordMessage) -> bool:
     """Skip empty, bot receipts, progress lines, cards, and object-store captions."""
 
     content = (message.content or "").strip()
-    if not content:
+    embeds = None
+    components = None
+    meta = getattr(message, "metadata", None)
+    if isinstance(meta, dict):
+        raw_embeds = meta.get("embeds")
+        if isinstance(raw_embeds, list):
+            embeds = raw_embeds
+        raw_components = meta.get("components")
+        if isinstance(raw_components, list):
+            components = raw_components
+    if is_harness_message(content, embeds, components):
         return False
-    if content.startswith("**Receipt**"):
+    if not content:
         return False
     if is_harness_card(content):
         return False
@@ -307,9 +325,19 @@ def _absorb_connect(
         env=env,
         delete_ok=delete_ok,
     )
-    poster = getattr(discord, "send_message", None)
-    if callable(poster) and result.card:
-        poster(channel_id, result.card, thread_id=thread_id)
+    if result.card:
+        send_card(
+            discord,
+            channel_id,
+            connect_card(
+                provider=result.provider,
+                fingerprint=result.fingerprint,
+                source=result.source,
+                ticket=result.ticket,
+                error=result.error,
+            ),
+            thread_id=thread_id,
+        )
 
 
 def _absorb_open(
@@ -338,9 +366,17 @@ def _absorb_open(
         runner=runner,
         browser_open=browser_open,
     )
-    poster = getattr(discord, "send_message", None)
-    if callable(poster) and result.card:
-        poster(channel_id, result.card, thread_id=thread_id)
+    if result.card:
+        send_card(
+            discord,
+            channel_id,
+            open_card(
+                surface=result.surface,
+                target=result.target,
+                error=result.error,
+            ),
+            thread_id=thread_id,
+        )
 
 
 def _channel_is_armed(store: Any, channel_id: str) -> bool:
@@ -392,7 +428,23 @@ def publish_host_card(
     from agent_discord.host.panel import host_panel_components
 
     armed = _channel_is_armed(store, channel_id)
-    card = render_host_card(armed=armed, channel_id=channel_id)
+    jobs: list[dict] = []
+    lister = getattr(store, "list_recent_jobs", None)
+    if callable(lister):
+        try:
+            jobs = list(lister(channel_id, limit=5))
+        except Exception:
+            jobs = []
+    avatar_url = ""
+    token = str(getattr(getattr(discord, "provider", None), "_bot_token", "") or "")
+    if token:
+        try:
+            from agent_discord.discord.rest import bot_avatar_url, fetch_bot_identity
+
+            avatar_url = bot_avatar_url(fetch_bot_identity(token=token))
+        except Exception:
+            avatar_url = ""
+    card = host_card(armed=armed, channel_id=channel_id, avatar_url=avatar_url)
     control = None
     reader = getattr(store, "get_host_control", None)
     if callable(reader):
@@ -401,30 +453,21 @@ def publish_host_card(
         except Exception:
             control = None
     card_id = str((control or {}).get("card_message_id") or "")
-    buttons = host_panel_components(armed)
-    editor = getattr(discord, "edit_message", None)
-    if card_id and callable(editor):
+    buttons = host_panel_components(armed, jobs=jobs)
+    if card_id:
         try:
-            editor(channel_id, card_id, card, components=buttons)
+            edit_card(discord, channel_id, card_id, card, components=buttons)
             return
-        except TypeError:
-            try:
-                editor(channel_id, card_id, card)
-                return
-            except Exception:
-                pass
         except Exception:
             pass
-    poster = getattr(discord, "send_message", None)
-    if not callable(poster):
-        return
     try:
-        posted = poster(channel_id, card, thread_id=thread_id, components=buttons)
-    except TypeError:
-        try:
-            posted = poster(channel_id, card, thread_id=thread_id)
-        except Exception:
-            return
+        posted = send_card(
+            discord,
+            channel_id,
+            card,
+            thread_id=thread_id,
+            components=buttons,
+        )
     except Exception:
         return
     message_id = ""

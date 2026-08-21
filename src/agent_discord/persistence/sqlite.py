@@ -337,6 +337,40 @@ class SQLiteStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_recent_jobs(
+        self, channel_id: str, *, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        capped = max(1, min(int(limit), 25))
+        rows = self._connection().execute(
+            """
+            SELECT t.task_id, t.intake_text, t.status AS task_status,
+                   r.run_id, r.summary, r.status AS run_status
+            FROM tasks t
+            LEFT JOIN runs r ON r.task_id = t.task_id
+            WHERE t.channel_id=?
+            ORDER BY t.updated_at DESC
+            LIMIT ?
+            """,
+            (channel_id, capped),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            run_id = str(row["run_id"] or "")
+            if not run_id or run_id in seen:
+                continue
+            seen.add(run_id)
+            items.append(
+                {
+                    "task_id": str(row["task_id"] or ""),
+                    "run_id": run_id,
+                    "intake_text": str(row["intake_text"] or ""),
+                    "summary": str(row["summary"] or ""),
+                    "status": str(row["run_status"] or row["task_status"] or ""),
+                }
+            )
+        return items
+
     # --- events ---
 
     def append_event(

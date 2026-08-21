@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from agent_discord.contracts import DiscordAttachment, DiscordMessage
 from agent_discord.discord.errors import ToolInvocationError
+from agent_discord.discord.layout import FLAG_COMPONENTS_V2
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 USER_AGENT = "discord-os (https://github.com/professorpalmer/agent-discord)"
@@ -57,7 +58,60 @@ def fetch_bot_identity(
     return {
         "id": str(raw.get("id") or ""),
         "username": str(raw.get("username") or ""),
+        "avatar": str(raw.get("avatar") or ""),
     }
+
+
+def bot_avatar_url(identity: Mapping[str, Any]) -> str:
+    user_id = str(identity.get("id") or "").strip()
+    avatar = str(identity.get("avatar") or "").strip()
+    if user_id and avatar:
+        return f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png?size=128"
+    if user_id.isdigit():
+        return f"https://cdn.discordapp.com/embed/avatars/{int(user_id) % 6}.png"
+    return ""
+
+
+def start_message_thread(
+    *,
+    token: str,
+    channel_id: str,
+    message_id: str,
+    name: str,
+    opener: Optional[UrlOpener] = None,
+) -> str:
+    title = (name or "job").replace("\n", " ").strip() or "job"
+    raw = call_discord_json(
+        token,
+        "POST",
+        f"/channels/{channel_id}/messages/{message_id}/threads",
+        payload={"name": title[:100], "auto_archive_duration": 1440},
+        opener=opener,
+    )
+    if not isinstance(raw, dict):
+        raise ToolInvocationError("Discord thread create was not an object")
+    thread_id = str(raw.get("id") or "").strip()
+    if not thread_id:
+        raise ToolInvocationError("Discord thread create missing id")
+    return thread_id
+
+
+def patch_bot_avatar(
+    *,
+    token: str,
+    png_bytes: bytes,
+    opener: Optional[UrlOpener] = None,
+) -> None:
+    import base64
+
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    call_discord_json(
+        token,
+        "PATCH",
+        "/users/@me",
+        payload={"avatar": f"data:image/png;base64,{encoded}"},
+        opener=opener,
+    )
 
 
 def list_channel_messages(
@@ -92,12 +146,23 @@ def send_channel_message(
     content: str,
     thread_id: Optional[str] = None,
     components: Optional[list[dict[str, Any]]] = None,
+    embeds: Optional[list[dict[str, Any]]] = None,
+    flags: int = 0,
     opener: Optional[UrlOpener] = None,
 ) -> DiscordMessage:
     dest = thread_id or channel_id
-    payload: dict[str, Any] = {"content": content}
-    if components:
-        payload["components"] = list(components)
+    payload: dict[str, Any] = {}
+    if flags:
+        payload["flags"] = int(flags)
+    if flags & FLAG_COMPONENTS_V2:
+        if components:
+            payload["components"] = list(components)
+    else:
+        payload["content"] = content or ""
+        if embeds:
+            payload["embeds"] = list(embeds)
+        if components:
+            payload["components"] = list(components)
     raw = call_discord_json(
         token,
         "POST",
@@ -120,11 +185,22 @@ def edit_channel_message(
     message_id: str,
     content: str,
     components: Optional[list[dict[str, Any]]] = None,
+    embeds: Optional[list[dict[str, Any]]] = None,
+    flags: int = 0,
     opener: Optional[UrlOpener] = None,
 ) -> DiscordMessage:
-    payload: dict[str, Any] = {"content": content}
-    if components is not None:
-        payload["components"] = list(components)
+    payload: dict[str, Any] = {}
+    if flags:
+        payload["flags"] = int(flags)
+    if flags & FLAG_COMPONENTS_V2:
+        if components is not None:
+            payload["components"] = list(components)
+    else:
+        payload["content"] = content or ""
+        if embeds is not None:
+            payload["embeds"] = list(embeds)
+        if components is not None:
+            payload["components"] = list(components)
     raw = call_discord_json(
         token,
         "PATCH",
@@ -163,8 +239,14 @@ def callback_interaction(
         with do_open(request, timeout=10) as resp:
             resp.read()
     except HTTPError as exc:
-        exc.read()
-        raise ToolInvocationError(f"Discord interaction callback HTTP {exc.code}") from None
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:240]
+        except Exception:
+            detail = ""
+        raise ToolInvocationError(
+            f"Discord interaction callback HTTP {exc.code} {detail}".strip()
+        ) from None
     except URLError as exc:
         raise ToolInvocationError("Discord interaction callback unreachable") from exc
 
@@ -192,16 +274,29 @@ def send_channel_attachment(
     data: bytes,
     content: str = "",
     thread_id: Optional[str] = None,
+    embeds: Optional[list[dict[str, Any]]] = None,
+    components: Optional[list[dict[str, Any]]] = None,
+    flags: int = 0,
     opener: Optional[UrlOpener] = None,
 ) -> DiscordMessage:
     """POST a file to a channel (or thread) via Discord REST multipart."""
 
     dest = thread_id or channel_id
     safe_name = _safe_filename(filename)
-    payload = {
-        "content": content or "",
+    payload: dict[str, Any] = {
         "attachments": [{"id": 0, "filename": safe_name}],
     }
+    if flags:
+        payload["flags"] = int(flags)
+    if flags & FLAG_COMPONENTS_V2:
+        if components:
+            payload["components"] = list(components)
+    else:
+        payload["content"] = content or ""
+        if embeds:
+            payload["embeds"] = list(embeds)
+        if components:
+            payload["components"] = list(components)
     body, content_type = _multipart_message(payload, safe_name, data)
     raw = _discord_request(
         token,
@@ -268,12 +363,9 @@ def download_channel_attachment(
     )
     if not isinstance(raw, dict):
         raise ToolInvocationError("Discord REST returned a non-object message")
-    for att in raw.get("attachments") or ():
-        if not isinstance(att, dict):
+    for att_id, url in _attachment_handles(raw):
+        if att_id != str(attachment_id):
             continue
-        if str(att.get("id") or "") != str(attachment_id):
-            continue
-        url = str(att.get("url") or att.get("proxy_url") or "")
         if not url:
             raise ToolInvocationError("attachment had no ephemeral CDN handle")
         return download_attachment_url(token=token, url=url, opener=opener)
@@ -293,28 +385,22 @@ def message_from_rest_payload(
         raise ToolInvocationError("Discord REST returned a non-object message")
     attachments: list[DiscordAttachment] = []
     for att in raw.get("attachments") or ():
-        if not isinstance(att, dict):
+        parsed = _attachment_from_rest(att)
+        if parsed is not None:
+            attachments.append(parsed)
+    components = raw.get("components") if isinstance(raw.get("components"), list) else []
+    seen = {item.attachment_id for item in attachments if item.attachment_id}
+    for parsed in _attachments_from_components(components):
+        if parsed.attachment_id and parsed.attachment_id in seen:
             continue
-        att_id = str(att.get("id") or "")
-        name = str(att.get("filename") or "")
-        if not att_id and not name:
-            continue
-        try:
-            size = int(att.get("size") or 0)
-        except (TypeError, ValueError):
-            size = 0
-        attachments.append(
-            DiscordAttachment(
-                attachment_id=att_id,
-                filename=name,
-                size=size,
-                content_type=str(att.get("content_type") or ""),
-            )
-        )
+        attachments.append(parsed)
+        if parsed.attachment_id:
+            seen.add(parsed.attachment_id)
     msg_thread = thread_id
     if raw.get("thread") and isinstance(raw["thread"], dict) and raw["thread"].get("id"):
         msg_thread = str(raw["thread"]["id"])
     author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+    embeds = raw.get("embeds") if isinstance(raw.get("embeds"), list) else []
     return DiscordMessage(
         channel_id=str(raw.get("channel_id") or channel_id),
         content=str(raw.get("content") or fallback_content),
@@ -322,8 +408,115 @@ def message_from_rest_payload(
         thread_id=msg_thread,
         author_id=str(author.get("id") or "") or None,
         attachments=tuple(attachments),
-        metadata={"provider": "discord-rest"},
+        metadata={
+            "provider": "discord-rest",
+            "embeds": embeds,
+            "components": _scrub_component_urls(components),
+            "flags": raw.get("flags") or 0,
+        },
     )
+
+
+def _attachment_from_rest(att: Any) -> Optional[DiscordAttachment]:
+    if not isinstance(att, dict):
+        return None
+    att_id = str(att.get("id") or att.get("attachment_id") or "")
+    name = str(att.get("filename") or att.get("name") or "")
+    if not att_id and not name:
+        return None
+    try:
+        size = int(att.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return DiscordAttachment(
+        attachment_id=att_id,
+        filename=name,
+        size=size,
+        content_type=str(att.get("content_type") or ""),
+    )
+
+
+def _attachment_id_from_url(url: str) -> str:
+    if "/attachments/" not in url:
+        return ""
+    parts = url.split("/attachments/", 1)[-1].split("/")
+    if len(parts) < 2:
+        return ""
+    return parts[1].split("?", 1)[0]
+
+
+def _walk_component_dicts(components: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for item in components or ():
+        if not isinstance(item, dict):
+            continue
+        found.append(item)
+        nested = item.get("components")
+        if isinstance(nested, list):
+            found.extend(_walk_component_dicts(nested))
+    return found
+
+
+def _attachments_from_components(components: Any) -> list[DiscordAttachment]:
+    found: list[DiscordAttachment] = []
+    for item in _walk_component_dicts(components):
+        if int(item.get("type") or 0) != 13:
+            continue
+        media = item.get("file") if isinstance(item.get("file"), dict) else {}
+        url = str(media.get("url") or media.get("proxy_url") or "")
+        att_id = _attachment_id_from_url(url) or str(media.get("attachment_id") or "")
+        name = str(item.get("name") or media.get("name") or media.get("filename") or "")
+        parsed = _attachment_from_rest(
+            {
+                "id": att_id,
+                "filename": name,
+                "size": item.get("size") or media.get("size") or 0,
+                "content_type": media.get("content_type") or "",
+            }
+        )
+        if parsed is not None:
+            found.append(parsed)
+    return found
+
+
+def _attachment_handles(raw: Mapping[str, Any]) -> list[tuple[str, str]]:
+    handles: list[tuple[str, str]] = []
+    for att in raw.get("attachments") or ():
+        if not isinstance(att, dict):
+            continue
+        att_id = str(att.get("id") or "")
+        url = str(att.get("url") or att.get("proxy_url") or "")
+        if att_id and url:
+            handles.append((att_id, url))
+    for item in _walk_component_dicts(raw.get("components")):
+        if int(item.get("type") or 0) != 13:
+            continue
+        media = item.get("file") if isinstance(item.get("file"), dict) else {}
+        url = str(media.get("url") or media.get("proxy_url") or "")
+        att_id = _attachment_id_from_url(url) or str(media.get("attachment_id") or "")
+        if att_id and url:
+            handles.append((att_id, url))
+    return handles
+
+
+def _scrub_component_urls(components: Any) -> list[Any]:
+    cleaned: list[Any] = []
+    for item in components or ():
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        copy = dict(item)
+        media = copy.get("file")
+        if isinstance(media, dict):
+            media = dict(media)
+            media.pop("url", None)
+            media.pop("proxy_url", None)
+            copy["file"] = media
+        nested = copy.get("components")
+        if isinstance(nested, list):
+            copy["components"] = _scrub_component_urls(nested)
+        cleaned.append(copy)
+    return cleaned
 
 
 def _safe_filename(filename: str) -> str:

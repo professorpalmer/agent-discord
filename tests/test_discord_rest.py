@@ -120,6 +120,37 @@ def test_message_from_rest_payload_strips_cdn_fields():
     assert msg.attachments[0].attachment_id == "a1"
 
 
+def test_message_from_rest_payload_reads_v2_file_component():
+    msg = message_from_rest_payload(
+        {
+            "id": "m2",
+            "channel_id": "ch",
+            "flags": 32768,
+            "components": [
+                {
+                    "type": 17,
+                    "components": [
+                        {
+                            "type": 13,
+                            "id": 4,
+                            "name": "note.txt",
+                            "size": 24,
+                            "file": {
+                                "id": "not-the-attachment",
+                                "url": "https://cdn.discordapp.com/attachments/ch/att-99/note.txt",
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        channel_id="ch",
+    )
+    assert msg.attachments[0].attachment_id == "att-99"
+    assert msg.attachments[0].filename == "note.txt"
+    assert "cdn.discordapp.com" not in json.dumps(msg.metadata)
+
+
 def test_download_channel_attachment_uses_fresh_handle_then_drops_it():
     calls: list[str] = []
 
@@ -194,13 +225,37 @@ def test_list_and_send_channel_messages_use_rest(tmp_path):
     assert captured["method"] == "POST"
 
 
+def test_start_message_thread_posts_name():
+    captured: dict[str, object] = {}
+
+    def opener(request, timeout=60):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(
+            json.dumps({"id": "thread-9", "type": 11}).encode("utf-8")
+        )
+
+    from agent_discord.discord.rest import start_message_thread
+
+    thread_id = start_message_thread(
+        token="tok",
+        channel_id="ch",
+        message_id="msg-1",
+        name="what is Discord OS?",
+        opener=opener,
+    )
+    assert thread_id == "thread-9"
+    assert captured["url"].endswith("/channels/ch/messages/msg-1/threads")
+    assert captured["body"]["name"] == "what is Discord OS?"
+
+
 def test_fetch_bot_identity_returns_public_fields_only():
     def opener(request, timeout=60):
         assert request.full_url.endswith("/users/@me")
         return _FakeResponse(json.dumps({"id": "bot-9", "username": "staff"}).encode("utf-8"))
 
     identity = fetch_bot_identity(token="tok", opener=opener)
-    assert identity == {"id": "bot-9", "username": "staff"}
+    assert identity == {"id": "bot-9", "username": "staff", "avatar": ""}
 
 
 def test_select_provider_defaults_to_rest(tmp_path):

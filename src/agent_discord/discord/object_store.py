@@ -128,22 +128,18 @@ class DiscordObjectStore:
         author_id: Optional[str] = None,
     ) -> DiscordObjectRef:
         digest = hashlib.sha256(data).hexdigest()
-        caption = {
-            "agent_discord_object": 1,
-            "kind": kind,
-            "filename": filename,
-            "sha256": digest,
-            "size": len(data),
-        }
-        if author_id:
-            caption["author_id"] = author_id
-        caption_json = json.dumps(caption, separators=(",", ":"))
+        from agent_discord.orchestration.cards import object_card
+
+        card = object_card(filename=filename, size=len(data), kind=kind)
+        payload = card.v2_payload()
         msg = self.facade.send_attachment(
             channel_id,
             filename,
             data,
-            content=caption_json,
+            content="",
             thread_id=thread_id,
+            components=payload["components"],
+            flags=payload["flags"],
         )
         if not msg.attachments:
             raise ObjectNotFoundError(

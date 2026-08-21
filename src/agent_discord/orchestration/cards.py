@@ -1,20 +1,176 @@
-"""Discord-safe harness cards. Stable skip prefix is ``**Card**``."""
+"""Discord-native harness cards. Skip marker is embed footer ``Discord OS``."""
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence
 
-from agent_discord.contracts import RunReceipt
-from agent_discord.orchestration.receipts import render_receipt
-from agent_discord.redaction import redact_text_markers
+from agent_discord import PRODUCT_NAME
+from agent_discord.contracts import RunReceipt, TaskStatus
+from agent_discord.discord.layout import (
+    FLAG_COMPONENTS_V2,
+    action_row,
+    attachment_component,
+    container,
+    discord_time,
+    iter_component_text,
+    link_button,
+    progress_bar,
+    section,
+    status_table,
+    text_display,
+    thumbnail,
+)
+from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
 
 
 CARD_PREFIX = "**Card**"
+CARD_FOOTER = PRODUCT_NAME
+
+COLOR_IDLE = 0x4E5058
+COLOR_LIVE = 0x248046
+COLOR_WORK = 0xC27C0E
+COLOR_FAIL = 0xDA373C
+COLOR_FILE = 0x5865F2
+
+_PROVIDER_LABELS = {"openrouter": "OpenRouter"}
+_SURFACE_LABELS = {
+    "files": "Files",
+    "terminal": "Terminal",
+    "browser": "Browser",
+}
+_RECEIPT_TITLES = {
+    TaskStatus.COMPLETED: ("Done", COLOR_LIVE),
+    TaskStatus.FAILED: ("Failed", COLOR_FAIL),
+    TaskStatus.CANCELLED: ("Cancelled", COLOR_IDLE),
+    TaskStatus.RUNNING: ("Working", COLOR_WORK),
+    TaskStatus.PROGRESS: ("Working", COLOR_WORK),
+    TaskStatus.PENDING: ("Queued", COLOR_IDLE),
+}
+
+
+@dataclass(frozen=True)
+class CardMessage:
+    """One Discord V2 container. ``text`` is the MCP fallback when V2 is dropped."""
+
+    kind: str
+    title: str
+    description: str = ""
+    color: int = COLOR_IDLE
+    fields: tuple[tuple[str, str, bool], ...] = ()
+    percent: Optional[float] = None
+    file_name: str = ""
+    link_url: str = ""
+    updated_ts: Optional[int] = None
+    avatar_url: str = ""
+
+    @property
+    def text(self) -> str:
+        lines = [self.title]
+        if self.description:
+            lines.append(self.description)
+        for name, value, _inline in self.fields:
+            lines.append(f"{name}: {value}")
+        return redact_text_markers("\n".join(lines))
+
+    def embeds(self) -> list[dict[str, Any]]:
+        embed: dict[str, Any] = {
+            "title": self.title,
+            "color": int(self.color),
+            "footer": {"text": CARD_FOOTER},
+        }
+        if self.description:
+            embed["description"] = self.description
+        if self.fields:
+            embed["fields"] = [
+                {"name": name, "value": value, "inline": bool(inline)}
+                for name, value, inline in self.fields
+            ]
+        return [embed]
+
+    def v2_components(
+        self,
+        *,
+        rows: Optional[list[dict[str, Any]]] = None,
+    ) -> list[dict[str, Any]]:
+        """One Container: heading, status table, body, file, buttons."""
+
+        heading = f"### {self.title}"
+        if self.avatar_url:
+            children: list[dict[str, Any]] = [
+                section([heading], thumbnail(self.avatar_url))
+            ]
+        else:
+            children = [text_display(heading)]
+        if self.kind == "HOST":
+            live = self.title == "Running"
+            children.append(
+                text_display(
+                    status_table(
+                        (
+                            ("power", "on" if live else "off"),
+                            ("listen", "live" if live else "idle"),
+                        )
+                    )
+                )
+            )
+        body_parts: list[str] = []
+        if self.description:
+            body_parts.append(self.description)
+        if self.percent is not None:
+            body_parts.append(f"`{progress_bar(self.percent)}`")
+        if self.fields:
+            body_parts.append(
+                "\n".join(f"`{name}`  {value}" for name, value, _inline in self.fields)
+            )
+        stamp = discord_time(self.updated_ts)
+        body_parts.append(f"-# {CARD_FOOTER}  ·  {stamp}")
+        children.append(text_display(redact_text_markers("\n\n".join(body_parts))))
+        if self.file_name:
+            children.append(attachment_component(self.file_name))
+        extra = list(rows or [])
+        if self.link_url:
+            extra.append(action_row([link_button("Open", self.link_url)]))
+        if extra:
+            children.extend(extra)
+        return [container(children, color=self.color)]
+
+    def v2_payload(
+        self,
+        *,
+        rows: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        return {
+            "flags": FLAG_COMPONENTS_V2,
+            "components": self.v2_components(rows=rows),
+        }
 
 
 def is_harness_card(content: str) -> bool:
     text = (content or "").strip()
-    return text.startswith(CARD_PREFIX)
+    return text.startswith(CARD_PREFIX) or text.startswith("**Receipt**")
+
+
+def is_harness_message(
+    content: str,
+    embeds: Optional[Sequence[MappingLike]] = None,
+    components: Optional[Sequence[MappingLike]] = None,
+) -> bool:
+    if is_harness_card(content):
+        return True
+    for embed in embeds or ():
+        if not isinstance(embed, dict):
+            continue
+        footer = embed.get("footer")
+        text = ""
+        if isinstance(footer, dict):
+            text = str(footer.get("text") or "")
+        if text == CARD_FOOTER or text.startswith(f"{CARD_FOOTER} "):
+            return True
+    for text in iter_component_text(components):
+        if CARD_FOOTER in text or text.startswith(CARD_PREFIX):
+            return True
+    return False
 
 
 def render_connect_card(
@@ -25,21 +181,50 @@ def render_connect_card(
     ticket: str = "",
     error: str = "",
 ) -> str:
-    lines = [f"{CARD_PREFIX} CONNECT", f"Provider: `{provider}`"]
-    if source:
-        lines.append(f"Source: `{source}`")
-    if fingerprint:
-        lines.append(f"Fingerprint: `…{fingerprint}`")
-    if ticket:
-        lines.append(f"Ticket: `{ticket}`")
-        lines.append(
-            f"Run on the host: `discord-os connect --ticket {ticket} "
-            f"--provider {provider}`"
-        )
-        lines.append("Paste the key on stdin of the host. Ticket expires in 15 minutes.")
+    return connect_card(
+        provider=provider,
+        fingerprint=fingerprint,
+        source=source,
+        ticket=ticket,
+        error=error,
+    ).text
+
+
+def connect_card(
+    *,
+    provider: str,
+    fingerprint: str = "",
+    source: str = "",
+    ticket: str = "",
+    error: str = "",
+) -> CardMessage:
+    _ = fingerprint
+    label = _PROVIDER_LABELS.get(provider, provider or "OpenRouter")
     if error:
-        lines.append(f"Error: {error}")
-    return redact_text_markers("\n".join(lines))
+        return CardMessage(
+            kind="CONNECT",
+            title="Connect failed",
+            description=redact_text_markers(error),
+            color=COLOR_FAIL,
+        )
+    if ticket:
+        return CardMessage(
+            kind="CONNECT",
+            title="Finish on the host",
+            description=(
+                f"Run this on the machine, then paste the {label} key on stdin.\n"
+                f"discord-os connect --ticket {ticket} --provider {provider}\n"
+                "Expires in 15 minutes."
+            ),
+            color=COLOR_IDLE,
+        )
+    detail = "from this host" if source == "env" else "on this host"
+    return CardMessage(
+        kind="CONNECT",
+        title="Connected",
+        description=f"{label} is ready {detail}.",
+        color=COLOR_LIVE,
+    )
 
 
 def render_progress_card(
@@ -49,19 +234,72 @@ def render_progress_card(
     percent: Optional[float] = None,
     run_id: str = "",
 ) -> str:
-    pct = f" ({percent:.0f}%)" if percent is not None else ""
-    lines = [f"{CARD_PREFIX} PROGRESS"]
-    if run_id:
-        lines.append(f"Run: `{run_id}`")
-    lines.append(f"[{stage}] {message}{pct}")
-    return redact_text_markers("\n".join(lines))
+    return progress_card(
+        stage=stage, message=message, percent=percent, run_id=run_id
+    ).text
+
+
+def progress_card(
+    *,
+    stage: str,
+    message: str,
+    percent: Optional[float] = None,
+    run_id: str = "",
+) -> CardMessage:
+    _ = run_id
+    title = _title_case(stage) or "Working"
+    body = redact_text_markers(message or "")
+    return CardMessage(
+        kind="PROGRESS",
+        title=title,
+        description=body,
+        color=COLOR_WORK,
+        percent=percent,
+    )
 
 
 def render_receipt_card(receipt: RunReceipt, *, max_progress: int = 5) -> str:
-    body = render_receipt(receipt, max_progress=max_progress)
-    if body.startswith(CARD_PREFIX):
-        return body
-    return redact_text_markers(f"{CARD_PREFIX} RECEIPT\n{body}")
+    return receipt_card(receipt, max_progress=max_progress).text
+
+
+def receipt_card(receipt: RunReceipt, *, max_progress: int = 5) -> CardMessage:
+    title, color = _RECEIPT_TITLES.get(receipt.status, ("Receipt", COLOR_IDLE))
+    summary = str(strip_forbidden_keys({"summary": receipt.summary}).get("summary", ""))
+    description = redact_text_markers(summary.strip() or title)
+    fields: list[tuple[str, str, bool]] = []
+    jump = ""
+    if receipt.artifacts:
+        lines = []
+        for art in receipt.artifacts:
+            _ = strip_forbidden_keys(dict(art.provenance))
+            obj = art.as_object_ref()
+            if obj is not None:
+                from agent_discord.contracts import discord_jump_url
+
+                if not jump:
+                    jump = discord_jump_url(
+                        obj.guild_id, obj.channel_id, obj.message_id
+                    )
+                lines.append(obj.filename or art.kind)
+            elif art.path:
+                lines.append(art.path)
+            else:
+                lines.append(art.kind)
+        if lines:
+            fields.append(("Files", "\n".join(lines[:8]), False))
+    if receipt.usage and receipt.usage.model:
+        fields.append(("Model", receipt.usage.model, True))
+    if receipt.error:
+        fields.append(("Error", redact_text_markers(receipt.error)[:1024], False))
+    _ = max_progress
+    return CardMessage(
+        kind="RECEIPT",
+        title=title,
+        description=description,
+        color=color,
+        fields=tuple(fields),
+        link_url=jump,
+    )
 
 
 def render_open_card(
@@ -70,14 +308,25 @@ def render_open_card(
     target: str,
     error: str = "",
 ) -> str:
-    lines = [f"{CARD_PREFIX} OPEN", f"Surface: `{surface}`"]
-    if target:
-        lines.append(f"Target: `{target}`")
+    return open_card(surface=surface, target=target, error=error).text
+
+
+def open_card(*, surface: str, target: str, error: str = "") -> CardMessage:
+    label = _SURFACE_LABELS.get(surface, surface or "Host")
     if error:
-        lines.append(f"Error: {error}")
-    else:
-        lines.append("Opened on the listen host.")
-    return redact_text_markers("\n".join(lines))
+        return CardMessage(
+            kind="OPEN",
+            title="Could not open",
+            description=redact_text_markers(error),
+            color=COLOR_FAIL,
+        )
+    detail = target if surface == "browser" and target else label
+    return CardMessage(
+        kind="OPEN",
+        title="Opened",
+        description=detail,
+        color=COLOR_LIVE,
+    )
 
 
 def render_host_card(
@@ -85,18 +334,40 @@ def render_host_card(
     armed: bool,
     channel_id: str = "",
 ) -> str:
-    power = "on" if armed else "off"
-    lines = [
-        f"{CARD_PREFIX} HOST",
-        f"Power: `{power}`",
-    ]
-    if channel_id:
-        lines.append(f"Channel: `{channel_id}`")
+    return host_card(armed=armed, channel_id=channel_id).text
+
+
+def host_card(
+    *,
+    armed: bool,
+    channel_id: str = "",
+    confirm_off: bool = False,
+    avatar_url: str = "",
+) -> CardMessage:
+    _ = channel_id
+    if confirm_off:
+        return CardMessage(
+            kind="HOST",
+            title="Stop?",
+            description="Press Confirm to stop, or Cancel to keep running.",
+            color=COLOR_WORK,
+            avatar_url=avatar_url,
+        )
     if armed:
-        lines.append("Accepting work. Press Off to stop.")
-    else:
-        lines.append("Stopped. Press On to start.")
-    return redact_text_markers("\n".join(lines))
+        return CardMessage(
+            kind="HOST",
+            title="Running",
+            description="Press Ask, or type a task here. Off needs a confirm.",
+            color=COLOR_LIVE,
+            avatar_url=avatar_url,
+        )
+    return CardMessage(
+        kind="HOST",
+        title="Stopped",
+        description="Press On to start.",
+        color=COLOR_IDLE,
+        avatar_url=avatar_url,
+    )
 
 
 def render_overflow_card(
@@ -107,14 +378,140 @@ def render_overflow_card(
     jump_url: str,
     local_stash: str = "",
 ) -> str:
-    lines = [
-        f"{CARD_PREFIX} OVERFLOW",
-        f"Kind: `overflow`",
-        f"File: `{filename}`",
-        f"SHA-256: `{sha256}`",
-        f"Size: {size}",
-        f"Jump: {jump_url}",
-    ]
+    return overflow_card(
+        filename=filename,
+        sha256=sha256,
+        size=size,
+        jump_url=jump_url,
+        local_stash=local_stash,
+    ).text
+
+
+def overflow_card(
+    *,
+    filename: str,
+    sha256: str,
+    size: int,
+    jump_url: str,
+    local_stash: str = "",
+) -> CardMessage:
+    _ = sha256
+    fields: list[tuple[str, str, bool]] = [("Size", format_size(size), True)]
     if local_stash:
-        lines.append(f"Stash: `{local_stash}`")
-    return redact_text_markers("\n".join(lines))
+        fields.append(("Host copy", local_stash, False))
+    return CardMessage(
+        kind="OVERFLOW",
+        title="Too large for Discord",
+        description=filename,
+        color=COLOR_FAIL,
+        fields=tuple(fields),
+        link_url=jump_url,
+    )
+
+
+def object_card(*, filename: str, size: int, kind: str = "blob") -> CardMessage:
+    label = "Overflow pointer" if kind == "overflow" else filename
+    return CardMessage(
+        kind="OBJECT",
+        title=label,
+        description=format_size(size),
+        color=COLOR_FILE,
+        file_name="" if kind == "overflow" else filename,
+    )
+
+
+def format_size(size: int) -> str:
+    n = max(0, int(size))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        value = n / 1024
+        return f"{value:.1f} KB".replace(".0 KB", " KB")
+    value = n / (1024 * 1024)
+    return f"{value:.1f} MB".replace(".0 MB", " MB")
+
+
+def send_card(
+    discord: Any,
+    channel_id: str,
+    card: CardMessage,
+    *,
+    thread_id: Optional[str] = None,
+    components: Optional[list[dict[str, Any]]] = None,
+) -> Any:
+    poster = getattr(discord, "send_message", None)
+    if not callable(poster):
+        return None
+    payload = card.v2_payload(rows=components)
+    try:
+        return poster(
+            channel_id,
+            "",
+            thread_id=thread_id,
+            components=payload["components"],
+            flags=payload["flags"],
+        )
+    except TypeError:
+        try:
+            return poster(
+                channel_id,
+                "",
+                thread_id=thread_id,
+                embeds=card.embeds(),
+                components=components,
+            )
+        except TypeError:
+            try:
+                return poster(
+                    channel_id, card.text, thread_id=thread_id, components=components
+                )
+            except TypeError:
+                return poster(channel_id, card.text, thread_id=thread_id)
+
+
+def edit_card(
+    discord: Any,
+    channel_id: str,
+    message_id: str,
+    card: CardMessage,
+    *,
+    components: Optional[list[dict[str, Any]]] = None,
+) -> Any:
+    editor = getattr(discord, "edit_message", None)
+    if not callable(editor):
+        raise TypeError("edit_message is not available")
+    payload = card.v2_payload(rows=components)
+    try:
+        return editor(
+            channel_id,
+            message_id,
+            "",
+            components=payload["components"],
+            flags=payload["flags"],
+        )
+    except TypeError:
+        try:
+            return editor(
+                channel_id,
+                message_id,
+                "",
+                embeds=card.embeds(),
+                components=components,
+            )
+        except TypeError:
+            if components is not None:
+                try:
+                    return editor(
+                        channel_id, message_id, card.text, components=components
+                    )
+                except TypeError:
+                    pass
+            return editor(channel_id, message_id, card.text)
+
+
+def _title_case(stage: str) -> str:
+    raw = (stage or "").replace("_", " ").strip()
+    return raw[:1].upper() + raw[1:] if raw else ""
+
+
+MappingLike = dict[str, Any]

@@ -19,7 +19,13 @@ from agent_discord.contracts import (
 )
 from agent_discord.discord.facade import DiscordFacade
 from agent_discord.discord.object_store import DEFAULT_MAX_OBJECT_BYTES, DiscordObjectStore
-from agent_discord.orchestration.cards import render_progress_card, render_receipt_card
+from agent_discord.orchestration.cards import (
+    edit_card,
+    progress_card,
+    receipt_card,
+    send_card,
+)
+from agent_discord.orchestration.routing import compute_dispatch_mode
 from agent_discord.persistence.research import ResearchMemoryStore
 from agent_discord.persistence.sqlite import SQLiteStore
 from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
@@ -152,14 +158,37 @@ class AgentOrchestrator:
 
         progress_items: list[ProgressSummary] = []
         progress_message_id: Optional[str] = None
+        job_thread_id = intake.thread_id
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
             prompt=intake.text,
             model=pin.canonical,
             context=snapshot,
-            metadata={"channel_id": intake.channel_id},
+            metadata={
+                "channel_id": intake.channel_id,
+                "compute_mode": compute_dispatch_mode(intake.text),
+            },
         )
+        if self.post_progress_to_discord and self.discord is not None:
+            start_card = progress_card(
+                stage="start",
+                message="Starting.",
+                percent=1,
+                run_id=run_id,
+            )
+            progress_message_id = self._post_or_edit_progress(
+                intake.channel_id,
+                start_card,
+                thread_id=job_thread_id,
+                message_id=None,
+            )
+            if progress_message_id and not job_thread_id:
+                job_thread_id = self._start_job_thread(
+                    intake.channel_id,
+                    progress_message_id,
+                    intake.text,
+                )
         result = self.backend.dispatch(request)
 
         for event in result.events:
@@ -194,7 +223,7 @@ class AgentOrchestrator:
                 and self.discord is not None
                 and event.kind == EventKind.PROGRESS
             ):
-                card = render_progress_card(
+                card = progress_card(
                     stage=summary.stage,
                     message=summary.message,
                     percent=summary.percent,
@@ -203,7 +232,7 @@ class AgentOrchestrator:
                 progress_message_id = self._post_or_edit_progress(
                     intake.channel_id,
                     card,
-                    thread_id=intake.thread_id,
+                    thread_id=job_thread_id,
                     message_id=progress_message_id,
                 )
 
@@ -251,7 +280,8 @@ class AgentOrchestrator:
             usage=result.usage,
             error=safe_error,
         )
-        rendered = render_receipt_card(receipt)
+        card = receipt_card(receipt)
+        rendered = card.text
         self._event(
             task_id,
             run_id,
@@ -262,10 +292,11 @@ class AgentOrchestrator:
         )
 
         if self.post_progress_to_discord and self.discord is not None:
-            self.discord.send_message(
+            send_card(
+                self.discord,
                 intake.channel_id,
-                rendered,
-                thread_id=intake.thread_id,
+                card,
+                thread_id=job_thread_id,
             )
 
         return receipt
@@ -429,10 +460,28 @@ class AgentOrchestrator:
             ],
         }
 
+    def _start_job_thread(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+    ) -> Optional[str]:
+        if self.discord is None:
+            return None
+        starter = getattr(self.discord, "start_thread_from_message", None)
+        if not callable(starter):
+            return None
+        try:
+            title = (text or "job").replace("\n", " ").strip() or "job"
+            thread_id = starter(channel_id, message_id, title[:100])
+        except Exception:
+            return None
+        return str(thread_id or "") or None
+
     def _post_or_edit_progress(
         self,
         channel_id: str,
-        content: str,
+        card: Any,
         *,
         thread_id: Optional[str],
         message_id: Optional[str],
@@ -441,13 +490,15 @@ class AgentOrchestrator:
             return message_id
         if message_id:
             try:
-                edited = self.discord.edit_message(channel_id, message_id, content)
+                edited = edit_card(self.discord, channel_id, message_id, card)
                 return edited.message_id or message_id
             except Exception:
                 pass
-        posted = self.discord.send_message(channel_id, content, thread_id=thread_id)
-        if posted:
+        posted = send_card(self.discord, channel_id, card, thread_id=thread_id)
+        if isinstance(posted, list) and posted:
             return posted[-1].message_id or message_id
+        if posted is not None:
+            return getattr(posted, "message_id", None) or message_id
         return message_id
 
     def cancel(self, run_id: str) -> bool:
