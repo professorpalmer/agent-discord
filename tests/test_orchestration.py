@@ -286,8 +286,7 @@ def test_token_stream_flushes_card_on_interval_not_per_token(tmp_path: Path, mon
     assert receipt.status == TaskStatus.COMPLETED
     assert 1 <= facade.edit_count <= 3
     assert facade.edit_count < 16
-    assert 2 <= facade.thread_sends <= 4
-    assert facade.thread_sends < 16
+    assert facade.thread_sends == 0
     store.close()
 
 
@@ -309,4 +308,52 @@ def test_percent_progress_still_edits_immediately(tmp_path: Path):
         )
     ]
     assert edited or fake_discord.sent
+    store.close()
+
+
+def test_live_card_stays_one_message(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        "agent_discord.orchestration.orchestrator._monotonic",
+        clock,
+    )
+    store = SQLiteStore(tmp_path / "one.sqlite3")
+    store.initialize()
+    fake_discord = FakeDiscordMCPProvider()
+    facade = _CountingFacade(
+        DiscordFacade(fake_discord, bot_token_fingerprint="fp", owner_id="test")
+    )
+    orch = AgentOrchestrator(
+        store=store,
+        backend=_TokenStreamBackend(clock),
+        discord=facade,
+        post_progress_to_discord=True,
+        host_repos=(),
+    )
+    orch.run_task(TaskIntake(text="stream tokens", channel_id="ch", workspace_id="ws"))
+    assert len(fake_discord.sent) == 1
+    assert facade.thread_sends == 0
+    store.close()
+
+
+def test_named_repo_sets_worker_cwd(tmp_path: Path):
+    from agent_discord.host.repos import HostRepo
+
+    repo = tmp_path / "Puppetmaster"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    orch, store, _fake, backend = _orch(tmp_path)
+    orch.host_repos = (HostRepo(name="puppetmaster", path=repo, aliases=("puppetmaster",)),)
+    orch.compute_cwd = tmp_path / ".agent-discord"
+    orch.run_task(
+        TaskIntake(
+            text="check my puppetmaster repo for open PRs",
+            channel_id="ch",
+            workspace_id="ws",
+        )
+    )
+    assert backend.last_request is not None
+    assert backend.last_request.metadata["cwd"] == str(repo)
+    assert backend.last_request.metadata["repo"] == "puppetmaster"
+    assert "gh pr list" in backend.last_request.metadata["host_reach"]
     store.close()

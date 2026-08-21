@@ -21,6 +21,10 @@ from agent_discord.contracts import (
 )
 from agent_discord.discord.facade import DiscordFacade
 from agent_discord.discord.object_store import DEFAULT_MAX_OBJECT_BYTES, DiscordObjectStore
+from agent_discord.host.memory import memory_reach_block, recall_think_tank, settle_think_tank
+from agent_discord.host.realms import realm_for_channel
+from agent_discord.host.repos import HostRepo, host_reach_block, load_host_repos, resolve_host_repo
+from agent_discord.host.tools import load_host_tools, tools_reach_block
 from agent_discord.orchestration.cards import (
     edit_card,
     progress_card,
@@ -40,13 +44,7 @@ from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
 
 TOKEN_CARD_FLUSH_SECONDS = 0.35
 TOKEN_TEXT_LIMIT = 1500
-_THREAD_PHASES = frozenset({"thinking", "plan", "code"})
 _STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
-_PHASE_THREAD_LABELS = {
-    "thinking": "Thinking",
-    "plan": "Plan",
-    "code": "Code",
-}
 _SWARM_ROLES = (
     "explore",
     "pipeline-mapper",
@@ -65,6 +63,32 @@ def _is_token_stream(details: Mapping[str, Any]) -> bool:
     return bool(details.get("token")) or "stream_phase" in details
 
 
+def _visible_card_text(text: str) -> str:
+    from agent_discord.puppetmaster.backend import usable_worker_text
+
+    raw = (text or "").strip()
+    if raw[:1] in "{[":
+        return ""
+    return usable_worker_text(raw)
+
+
+def _strip_prompt_section(block: str, heading: str) -> str:
+    skip = False
+    kept: list[str] = []
+    marker = (heading or "").strip().lower()
+    for line in (block or "").splitlines():
+        stripped = line.strip().lower()
+        if stripped == marker:
+            skip = True
+            continue
+        if skip and stripped.startswith("[") and stripped.endswith("]") and stripped != marker:
+            skip = False
+        if skip:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 class AgentOrchestrator:
     """intake → context snapshot → pinned dispatch → events → Discord → receipt."""
 
@@ -79,6 +103,8 @@ class AgentOrchestrator:
         research: Optional[ResearchMemoryStore] = None,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         workspace: Optional[Path] = None,
+        compute_cwd: Optional[Path] = None,
+        host_repos: Optional[tuple[HostRepo, ...]] = None,
         retry_backoff_s: float = 0.0,
         presence: Optional[Callable[[str, str], None]] = None,
     ) -> None:
@@ -91,6 +117,8 @@ class AgentOrchestrator:
         self.research = research
         self.max_object_bytes = max_object_bytes
         self.workspace = Path(workspace) if workspace is not None else None
+        self.compute_cwd = Path(compute_cwd) if compute_cwd is not None else None
+        self.host_repos = host_repos
         self.retry_backoff_s = float(retry_backoff_s)
         self.presence = presence
         self._run_status: dict[str, TaskStatus] = {}
@@ -113,11 +141,11 @@ class AgentOrchestrator:
         task_id = uuid4().hex
         run_id = uuid4().hex
 
-        self.store.upsert_binding(
-            workspace_id=intake.workspace_id,
-            channel_id=intake.channel_id,
+        self.store.merge_binding_metadata(
+            intake.workspace_id,
+            intake.channel_id,
+            {"thread_id": intake.thread_id},
             guild_id=intake.guild_id,
-            metadata={"thread_id": intake.thread_id},
         )
         self.store.create_task(
             task_id=task_id,
@@ -169,6 +197,26 @@ class AgentOrchestrator:
                 limit=8,
             )
         )
+        tank = ""
+        if self.discord is not None:
+            try:
+                tank = recall_think_tank(
+                    self.discord,
+                    self.store,
+                    intake.text,
+                    workspace_id=intake.workspace_id,
+                )
+            except Exception:
+                tank = ""
+        if tank:
+            memories.insert(
+                0,
+                {
+                    "memory_id": "think-tank",
+                    "content": tank[:2000],
+                    "source": "think-tank",
+                },
+            )
         pref_block = ""
         reader = getattr(self.store, "prompt_memory_block", None)
         if callable(reader):
@@ -177,14 +225,16 @@ class AgentOrchestrator:
             except Exception:
                 pref_block = ""
         if pref_block:
-            memories.insert(
-                0,
-                {
-                    "memory_id": "preferences",
-                    "content": pref_block,
-                    "source": "preferences",
-                },
-            )
+            kept = _strip_prompt_section(pref_block, "[failures]")
+            if kept:
+                memories.insert(
+                    0,
+                    {
+                        "memory_id": "preferences",
+                        "content": kept,
+                        "source": "preferences",
+                    },
+                )
         binding = self.store.get_binding(intake.workspace_id, intake.channel_id) or {}
         research_context = self._optional_research_context(intake)
         provenance: dict[str, Any] = {
@@ -238,6 +288,34 @@ class AgentOrchestrator:
                 "compute_mode": compute_mode,
                 "workers": workers,
             }
+        )
+        repos = self.host_repos if self.host_repos is not None else load_host_repos()
+        channel_realm = realm_for_channel(
+            self.store,
+            intake.channel_id,
+            workspace_id=intake.workspace_id,
+            repos=repos,
+        )
+        chosen = resolve_host_repo(
+            intake.text,
+            repos,
+            default_cwd=self.compute_cwd,
+        )
+        if chosen is None:
+            chosen = channel_realm
+        run_cwd = chosen.path if chosen is not None else self.compute_cwd
+        if run_cwd is not None:
+            extra_meta["cwd"] = str(run_cwd)
+        if chosen is not None:
+            extra_meta["repo"] = chosen.name
+        extra_meta["host_reach"] = "\n\n".join(
+            item
+            for item in (
+                host_reach_block(repos, cwd=run_cwd),
+                tools_reach_block(load_host_tools()),
+                memory_reach_block(self.store, workspace_id=intake.workspace_id),
+            )
+            if item
         )
         approved = bool(extra_meta.get("approved"))
         if compute_mode == MODE_IMPLEMENT and not approved:
@@ -297,21 +375,21 @@ class AgentOrchestrator:
         token_text = ""
         token_dirty = False
         last_flush_at = _monotonic()
-        last_thread_phase: Optional[str] = None
         last_percent: Optional[float] = None
         stream_stage = "start"
         stream_error: Optional[str] = None
 
         def flush_token_card(*, force: bool = False) -> None:
             nonlocal progress_message_id, token_dirty, last_flush_at
-            if not token_dirty or not token_text:
+            visible = _visible_card_text(token_text)
+            if not token_dirty or not visible:
                 return
             if not force and (_monotonic() - last_flush_at) < TOKEN_CARD_FLUSH_SECONDS:
                 return
             if self.post_progress_to_discord and self.discord is not None:
                 card = progress_card(
                     stage=stream_stage,
-                    message=token_text,
+                    message=visible,
                     percent=last_percent,
                     run_id=run_id,
                 )
@@ -323,32 +401,6 @@ class AgentOrchestrator:
                 )
             token_dirty = False
             last_flush_at = _monotonic()
-
-        def post_phase_thread(stage: str) -> None:
-            nonlocal last_thread_phase
-            if stage not in _THREAD_PHASES or stage == last_thread_phase:
-                return
-            last_thread_phase = stage
-            if not (
-                job_thread_id
-                and self.post_progress_to_discord
-                and self.discord is not None
-            ):
-                return
-            try:
-                send_card(
-                    self.discord,
-                    intake.channel_id,
-                    progress_card(
-                        stage=stage,
-                        message=_PHASE_THREAD_LABELS.get(stage, stage),
-                        percent=last_percent,
-                        run_id=run_id,
-                    ),
-                    thread_id=job_thread_id,
-                )
-            except Exception:
-                pass
 
         for event in events_iter:
             safe_details = strip_forbidden_keys(dict(event.summary.details))
@@ -399,13 +451,15 @@ class AgentOrchestrator:
                     if phase in _STREAM_PHASES:
                         stream_stage = phase
                     flush_token_card()
-                    post_phase_thread(stream_stage)
+                    continue
+                visible = _visible_card_text(summary.message)
+                if not visible:
                     continue
                 if summary.stage:
                     stream_stage = summary.stage
                 card = progress_card(
                     stage=summary.stage,
-                    message=summary.message,
+                    message=visible,
                     percent=summary.percent,
                     run_id=run_id,
                 )
@@ -416,27 +470,6 @@ class AgentOrchestrator:
                     message_id=progress_message_id,
                 )
                 last_flush_at = _monotonic()
-                if job_thread_id and summary.details:
-                    reasoning_bits = []
-                    for key in ("reasoning_summary", "plan", "plan_summary", "approach", "findings"):
-                        value = summary.details.get(key)
-                        if value:
-                            reasoning_bits.append(f"**{key.replace('_', ' ').title()}:** {value}")
-                    if reasoning_bits:
-                        try:
-                            send_card(
-                                self.discord,
-                                intake.channel_id,
-                                progress_card(
-                                    stage="plan",
-                                    message="\n".join(reasoning_bits),
-                                    percent=last_percent,
-                                    run_id=run_id,
-                                ),
-                                thread_id=job_thread_id,
-                            )
-                        except Exception:
-                            pass
 
         flush_token_card(force=True)
 
@@ -512,6 +545,7 @@ class AgentOrchestrator:
         spoken = usable_worker_text(redact_text_markers(result.final_summary))
         if not spoken or _is_placeholder_summary(spoken):
             spoken = usable_worker_text(token_text) or spoken
+        spoken = _visible_card_text(spoken) or spoken
         safe_final_summary = spoken or "Worker finished without a written answer."
         safe_error = redact_text_markers(result.error) if result.error else None
         self.store.update_run(
@@ -530,6 +564,17 @@ class AgentOrchestrator:
             source="orchestrator",
             provenance={"task_id": task_id, "run_id": run_id, "status": result.status.value},
         )
+        if self.discord is not None and result.status == TaskStatus.COMPLETED:
+            try:
+                settle_think_tank(
+                    self.discord,
+                    self.store,
+                    workspace_id=intake.workspace_id,
+                    origin_channel=intake.channel_id,
+                    summary=safe_final_summary[:400],
+                )
+            except Exception:
+                pass
 
         receipt = RunReceipt(
             task_id=task_id,
@@ -553,7 +598,6 @@ class AgentOrchestrator:
         )
 
         if self.post_progress_to_discord and self.discord is not None:
-            painted_parent = False
             if progress_message_id:
                 try:
                     edit_card(
@@ -562,31 +606,10 @@ class AgentOrchestrator:
                         progress_message_id,
                         card,
                     )
-                    painted_parent = True
                 except Exception:
-                    send_card(
-                        self.discord,
-                        intake.channel_id,
-                        card,
-                        thread_id=job_thread_id,
-                    )
+                    send_card(self.discord, intake.channel_id, card)
             else:
-                send_card(
-                    self.discord,
-                    intake.channel_id,
-                    card,
-                    thread_id=job_thread_id,
-                )
-            if job_thread_id and (painted_parent or token_text.strip()):
-                try:
-                    send_card(
-                        self.discord,
-                        intake.channel_id,
-                        card,
-                        thread_id=job_thread_id,
-                    )
-                except Exception:
-                    pass
+                send_card(self.discord, intake.channel_id, card)
         self._set_presence("idle", "Discord OS")
 
         return receipt
@@ -609,19 +632,6 @@ class AgentOrchestrator:
         progress_items: list[ProgressSummary] = []
         for index, role in enumerate(roles):
             child_id = f"{run_id}-{role}"
-            child_thread = job_thread_id
-            if self.post_progress_to_discord and self.discord is not None and progress_message_id:
-                try:
-                    starter = getattr(self.discord, "start_thread", None)
-                    if callable(starter):
-                        started = starter(
-                            intake.channel_id,
-                            progress_message_id,
-                            name=f"{role}"[:90],
-                        )
-                        child_thread = getattr(started, "thread_id", None) or child_thread
-                except Exception:
-                    pass
             child = DispatchRequest(
                 task_id=task_id,
                 run_id=child_id,
@@ -631,7 +641,7 @@ class AgentOrchestrator:
                 metadata={**dict(request.metadata), "role": role, "parent_run_id": run_id},
             )
             result = self.backend.dispatch(child)
-            bit = redact_text_markers(result.final_summary or role)
+            bit = _visible_card_text(result.final_summary or role) or role
             summaries.append(f"{role}: {bit}")
             progress_items.append(
                 ProgressSummary(
@@ -641,20 +651,17 @@ class AgentOrchestrator:
                 )
             )
             if self.post_progress_to_discord and self.discord is not None:
-                try:
-                    send_card(
-                        self.discord,
-                        intake.channel_id,
-                        progress_card(
-                            stage=role,
-                            message=bit,
-                            percent=progress_items[-1].percent,
-                            run_id=child_id,
-                        ),
-                        thread_id=child_thread,
-                    )
-                except Exception:
-                    pass
+                progress_message_id = self._post_or_edit_progress(
+                    intake.channel_id,
+                    progress_card(
+                        stage=role,
+                        message=bit,
+                        percent=progress_items[-1].percent,
+                        run_id=run_id,
+                    ),
+                    thread_id=job_thread_id,
+                    message_id=progress_message_id,
+                )
 
         stitched = "\n".join(summaries)
         final_status = TaskStatus.COMPLETED
@@ -694,9 +701,9 @@ class AgentOrchestrator:
                 try:
                     edit_card(self.discord, intake.channel_id, progress_message_id, card)
                 except Exception:
-                    send_card(self.discord, intake.channel_id, card, thread_id=job_thread_id)
+                    send_card(self.discord, intake.channel_id, card)
             else:
-                send_card(self.discord, intake.channel_id, card, thread_id=job_thread_id)
+                send_card(self.discord, intake.channel_id, card)
         self._event(
             task_id,
             run_id,
@@ -1121,7 +1128,7 @@ class AgentOrchestrator:
                 edited = edit_card(self.discord, channel_id, message_id, card)
                 return edited.message_id or message_id
             except Exception:
-                pass
+                return message_id
         posted = send_card(self.discord, channel_id, card, thread_id=thread_id)
         if isinstance(posted, list) and posted:
             return posted[-1].message_id or message_id

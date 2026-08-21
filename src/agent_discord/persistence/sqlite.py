@@ -353,6 +353,43 @@ class SQLiteStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_bindings(self, workspace_id: str = "") -> list[dict[str, Any]]:
+        conn = self._connection()
+        if workspace_id:
+            rows = conn.execute(
+                "SELECT * FROM workspace_bindings WHERE workspace_id=? ORDER BY channel_id",
+                (workspace_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM workspace_bindings ORDER BY channel_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def merge_binding_metadata(
+        self,
+        workspace_id: str,
+        channel_id: str,
+        updates: Mapping[str, Any],
+        *,
+        guild_id: Optional[str] = None,
+    ) -> str:
+        current = self.get_binding(workspace_id, channel_id) or {}
+        raw = current.get("metadata_json") or "{}"
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except json.JSONDecodeError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(dict(updates))
+        return self.upsert_binding(
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            guild_id=guild_id if guild_id is not None else current.get("guild_id"),
+            metadata=meta,
+        )
+
     # --- tasks / runs ---
 
     def create_task(

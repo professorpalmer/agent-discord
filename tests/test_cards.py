@@ -60,6 +60,10 @@ def test_host_card_is_a_v2_panel():
     running = host_card(armed=True)
     assert running.title == "Running"
     assert "Writes: Auto." in running.description
+    realm = host_card(armed=True, realm="puppetmaster")
+    assert "Realm: puppetmaster." in realm.description
+    bank = host_card(armed=True, bank=True)
+    assert "think-tank memory" in bank.description
     gated = host_card(armed=True, write_gate=True)
     assert "Writes: Gate." in gated.description
     paired = host_card(armed=True, paired=True, operator_count=1, role_count=2)

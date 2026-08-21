@@ -9,6 +9,9 @@ from typing import Any, Mapping, Optional, Sequence
 
 from agent_discord.contracts import DiscordMessage, RunReceipt, TaskIntake
 from agent_discord.host.power import is_power_command, parse_power_command
+from agent_discord.host.memory import bind_memory_channel, is_memory_bind
+from agent_discord.host.realms import bind_channel_realm, is_bind_command, parse_bind_command
+from agent_discord.host.repos import load_host_repos
 from agent_discord.host.verbs import handle_open_message, is_open_command
 from agent_discord.keys.connect import (
     handle_connect_message,
@@ -189,6 +192,7 @@ def drain_inbound(
     host_roots: Optional[Sequence[Path]] = None,
     host_runner: Optional[Any] = None,
     browser_open: Optional[Any] = None,
+    job_pool: Optional[Any] = None,
 ) -> Sequence[RunReceipt]:
     """Read recent channel messages and dispatch each new human task once.
 
@@ -234,6 +238,28 @@ def drain_inbound(
                 thread_id=message.thread_id or thread_id,
                 workspace=ws,
                 env=env,
+            )
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
+        if is_bind_command(message.content or ""):
+            if not author_may_dispatch(
+                store,
+                message.author_id,
+                role_ids=_author_role_ids(message),
+            ):
+                watermark = _advance_listen_watermark(
+                    store, channel_id, created_ms, message.message_id, watermark
+                )
+                continue
+            _absorb_bind(
+                message,
+                discord=discord,
+                orchestrator=orchestrator,
+                channel_id=channel_id,
+                workspace_id=workspace_id,
+                thread_id=message.thread_id or thread_id,
             )
             watermark = _advance_listen_watermark(
                 store, channel_id, created_ms, message.message_id, watermark
@@ -339,20 +365,20 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
-        receipts.append(
-            orchestrator.run_task(
-                TaskIntake(
-                    text=text,
-                    channel_id=channel_id,
-                    workspace_id=workspace_id,
-                    guild_id=guild_id,
-                    thread_id=message.thread_id or thread_id,
-                    message_id=message.message_id or None,
-                    requester_id=message.author_id,
-                    metadata=intake_meta,
-                )
-            )
+        intake = TaskIntake(
+            text=text,
+            channel_id=channel_id,
+            workspace_id=workspace_id,
+            guild_id=guild_id,
+            thread_id=message.thread_id or thread_id,
+            message_id=message.message_id or None,
+            requester_id=message.author_id,
+            metadata=intake_meta,
         )
+        if job_pool is not None:
+            job_pool.submit(orchestrator.run_task, intake, write_key=channel_id)
+        else:
+            receipts.append(orchestrator.run_task(intake))
         watermark = _advance_listen_watermark(
             store, channel_id, created_ms, message.message_id, watermark
         )
@@ -503,12 +529,67 @@ def _absorb_power(
     publish_host_card(discord, store, channel_id, thread_id=thread_id)
 
 
+def _absorb_bind(
+    message: DiscordMessage,
+    *,
+    discord: Any,
+    orchestrator: Any,
+    channel_id: str,
+    workspace_id: str,
+    thread_id: Optional[str],
+) -> None:
+    store = getattr(orchestrator, "store", None)
+    _claim_inbound(store, discord, message, channel_id)
+    name = parse_bind_command(message.content or "")
+    repos = list(getattr(orchestrator, "host_repos", None) or load_host_repos())
+    chosen = None
+    if is_memory_bind(name):
+        bind_memory_channel(
+            store,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+        )
+    elif name:
+        chosen = bind_channel_realm(
+            store,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            name=name,
+            repos=repos,
+        )
+    realm = ""
+    if chosen is not None:
+        realm = chosen.name
+    elif name and not is_memory_bind(name):
+        realm = name
+    publish_host_card(
+        discord,
+        store,
+        channel_id,
+        thread_id=thread_id,
+        realm=realm or _realm_name(store, channel_id, workspace_id),
+    )
+
+
+def _realm_name(store: Any, channel_id: str, workspace_id: str = "default") -> str:
+    from agent_discord.host.realms import binding_metadata
+
+    reader = getattr(store, "get_binding", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(binding_metadata(reader(workspace_id, channel_id)).get("repo") or "")
+    except Exception:
+        return ""
+
+
 def publish_host_card(
     discord: Any,
     store: Any,
     channel_id: str,
     *,
     thread_id: Optional[str] = None,
+    realm: str = "",
 ) -> None:
     """Post or edit the HOST card. Best-effort — never raise on the listen path."""
 
@@ -545,6 +626,8 @@ def publish_host_card(
             avatar_url = bot_avatar_url(fetch_bot_identity(token=token))
         except Exception:
             avatar_url = ""
+    from agent_discord.host.memory import channel_is_memory
+
     card = host_card(
         armed=armed,
         channel_id=channel_id,
@@ -553,6 +636,8 @@ def publish_host_card(
         cap_usd=cap,
         halted=halted,
         write_gate=write_gate,
+        realm=realm or _realm_name(store, channel_id),
+        bank=channel_is_memory(store, channel_id),
     )
     control = None
     reader = getattr(store, "get_host_control", None)
