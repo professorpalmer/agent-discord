@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.6
+
+PyPI listing leads with `pip install discord-os`. Doc links on the package page go to GitHub, not pypi.org paths.
+
 ## 0.5.5
 
 Reply-first job threads, persist-then-settle, and host GitHub auth.

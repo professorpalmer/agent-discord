@@ -6,6 +6,10 @@ Your bot, on your machine. No hosted fleet. Leave the host running; turn work on
 
 Public package is [`discord-os`](https://pypi.org/project/discord-os/). Repo: [`professorpalmer/discord-os`](https://github.com/professorpalmer/discord-os). The `agent-discord` command still works.
 
+```bash
+pip install discord-os
+```
+
 ## Setup
 
 Once, in a browser: [Discord Developer Portal](https://discord.com/developers/applications) → New Application → **Bot** → Reset Token (`DISCORD_BOT_TOKEN`) → enable **Message Content Intent** → General Information → Application ID (`DISCORD_APPLICATION_ID`). Copy a private channel ID.
