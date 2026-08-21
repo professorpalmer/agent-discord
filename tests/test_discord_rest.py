@@ -288,3 +288,29 @@ def test_download_rejects_non_cdn_url():
             attachment_id="a1",
             opener=opener,
         )
+
+def test_add_message_reaction_puts_urlencoded_emoji():
+    captured: dict[str, object] = {}
+
+    def opener(request, timeout=60):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = request.data
+        return _FakeResponse(b"")
+
+    from agent_discord.discord.rest import add_message_reaction
+    from urllib.parse import quote
+
+    add_message_reaction(
+        token="tok",
+        channel_id="ch",
+        message_id="msg-1",
+        emoji="\U0001F440",
+        opener=opener,
+    )
+    assert captured["method"] == "PUT"
+    encoded = quote("\U0001F440", safe="")
+    assert captured["url"].endswith(
+        f"/channels/ch/messages/msg-1/reactions/{encoded}/@me"
+    )
+    assert captured["body"] is None

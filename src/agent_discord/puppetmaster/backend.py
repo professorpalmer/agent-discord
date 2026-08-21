@@ -121,6 +121,30 @@ _MONOLOGUE_PREFIXES = (
     "report:",
 )
 
+# Mid-sentence worker scaffolding. Match anywhere, not only line prefixes.
+_SCAFFOLDING_MARKERS = (
+    "first turn requirement",
+    "make a tool call first",
+    "submit_findings",
+    "let me quickly verify",
+    "let me do a tool call",
+    "let me write the prose",
+    "answer from this output",
+    "answer from that output",
+    "here's the answer for discord",
+    "here's the straight answer",
+    "let me write the discord answer",
+    "the task says",
+    "the requirement says",
+    "i must call",
+    "first response must include",
+)
+_ANSWER_CUT_RE = re.compile(
+    r"(?:here's the (?:straight )?answer for discord|let me write the discord answer)\s*:\s*",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(?:\s+|\n+)")
+
 
 def cli_supports_flag(cli: str, subcommand: str, flag: str) -> bool:
     """Probe ``cli subcommand --help`` once. Live Puppetmaster may lack --json-lines."""
@@ -175,6 +199,7 @@ class PuppetmasterCliBackend:
     cwd: Optional[str | Path] = None
     timeout_seconds: float = 3600.0
     _statuses: dict[str, TaskStatus] = field(default_factory=dict)
+    _steers: dict[str, list[str]] = field(default_factory=dict)
 
     def resolve_model(self, requested: str) -> ModelPin:
         self.pin.assert_allowed(requested)
@@ -318,6 +343,15 @@ class PuppetmasterCliBackend:
                 },
             ),
         )
+
+    def steer(self, run_id: str, text: str) -> None:
+        """Queue follow-up text for a live CLI worker."""
+
+        rid = (run_id or "").strip()
+        body = (text or "").strip()
+        if not rid or not body:
+            return
+        self._steers.setdefault(rid, []).append(body)
 
     def cancel(self, run_id: str) -> bool:
         """Report unsupported cancellation instead of calling a fake CLI command."""
@@ -613,23 +647,139 @@ def choose_spoken_answer(*candidates: str) -> str:
     return ""
 
 
-def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
-    """Keep human dialogue. Drop prompt echoes and CLI metadata."""
+def _take_discord_answer(text: str) -> str:
+    """If the worker labeled the user answer, keep only what follows."""
 
-    parts: list[str] = []
+    raw = text or ""
+    last = None
+    for match in _ANSWER_CUT_RE.finditer(raw):
+        last = match
+    if last is None:
+        return raw
+    return raw[last.end() :].strip()
+
+
+def _same_beat(left: str, right: str) -> bool:
+    return re.sub(r"\s+", " ", left or "").strip() == re.sub(r"\s+", " ", right or "").strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    parts = [part.strip() for part in _SENTENCE_SPLIT_RE.split(raw) if part.strip()]
+    return parts or [raw]
+
+
+def _is_scaffolding_sentence(sentence: str) -> bool:
+    raw = (sentence or "").strip()
+    if not raw:
+        return True
+    if _is_skipped_worker_line(raw):
+        return True
+    lower = raw.lower()
+    return any(marker in lower for marker in _SCAFFOLDING_MARKERS)
+
+
+def _drop_scaffolding_sentences(text: str) -> str:
+    kept_lines: list[str] = []
     for line in (text or "").splitlines():
-        raw = _strip_monologue_prefix(line.strip())
+        raw = line.strip()
         if not raw:
+            if kept_lines and kept_lines[-1] != "":
+                kept_lines.append("")
+            continue
+        sentences = [s for s in _split_sentences(raw) if not _is_scaffolding_sentence(s)]
+        deduped: list[str] = []
+        for sentence in sentences:
+            if deduped and _same_beat(deduped[-1], sentence):
+                continue
+            deduped.append(sentence)
+        if deduped:
+            kept_lines.append(" ".join(deduped))
+    return "\n".join(kept_lines).strip()
+
+
+def _dedup_repeated_body(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    paragraphs: list[str] = []
+    for para in re.split(r"\n\s*\n", raw):
+        item = para.strip()
+        if not item:
+            continue
+        if paragraphs and _same_beat(paragraphs[-1], item):
+            continue
+        paragraphs.append(item)
+    body = "\n\n".join(paragraphs)
+    lines: list[str] = []
+    for line in body.splitlines():
+        item = line.strip()
+        if lines and item and _same_beat(lines[-1], item):
+            continue
+        lines.append(item)
+    body = "\n".join(lines).strip()
+    compact = re.sub(r"\s+", " ", body).strip()
+    if len(compact) >= 40:
+        mid = len(compact) // 2
+        if _same_beat(compact[:mid], compact[mid:]):
+            return compact[:mid].strip()
+    return body
+
+
+def _clip_to_limit(text: str, limit: int) -> str:
+    raw = (text or "").strip()
+    if limit <= 0 or len(raw) <= limit:
+        return raw
+    window = raw[:limit].rstrip()
+    boundary = -1
+    for index, char in enumerate(window):
+        if char in ".!?" and (index + 1 == len(window) or window[index + 1].isspace()):
+            boundary = index
+    min_keep = max(24, limit // 5)
+    if boundary >= min_keep:
+        return window[: boundary + 1].rstrip()
+    space = window.rfind(" ")
+    if space >= min_keep:
+        return window[:space].rstrip() + "..."
+    return window[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _drop_unfinished_tail(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw or raw.endswith((".", "!", "?", ")", "]", '"')):
+        return raw
+    sentences = _split_sentences(raw)
+    if len(sentences) < 2:
+        return raw
+    last = sentences[-1]
+    if last.endswith((".", "!", "?")):
+        return raw
+    if ":" in last and len(last) < 80:
+        return raw
+    return " ".join(sentences[:-1]).strip()
+
+
+def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
+    """Keep human dialogue. Drop prompt echoes, scaffolding, and CLI metadata."""
+
+    raw = _take_discord_answer(text or "")
+    parts: list[str] = []
+    for line in raw.splitlines():
+        cleaned = _strip_monologue_prefix(line.strip())
+        if not cleaned:
             if parts and parts[-1] != "":
                 parts.append("")
             continue
-        if _is_skipped_worker_line(raw):
+        if _is_skipped_worker_line(cleaned):
             continue
-        parts.append(raw)
+        parts.append(cleaned)
     body = "\n".join(parts).strip()
-    if len(body) > limit:
-        return body[: max(0, limit - 3)].rstrip() + "..."
-    return body
+    body = _drop_scaffolding_sentences(body)
+    body = _dedup_repeated_body(body)
+    body = _drop_unfinished_tail(body)
+    return _clip_to_limit(body, limit)
 
 
 def _is_skipped_worker_line(raw: str) -> bool:

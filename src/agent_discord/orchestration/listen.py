@@ -366,13 +366,20 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
-        follow_thread = message.thread_id or thread_id
-        if (
-            follow_thread
-            and job_pool is not None
-            and getattr(job_pool, "is_thread_live", lambda _tid: False)(follow_thread)
-        ):
-            intake_meta["steer"] = True
+        follow_thread = _follow_thread_id(message, thread_id, orchestrator, job_pool)
+        if follow_thread and _thread_has_running_job(orchestrator, job_pool, follow_thread):
+            _steer_running_job(
+                orchestrator,
+                discord,
+                job_pool,
+                text=text,
+                channel_id=channel_id,
+                thread_id=follow_thread,
+            )
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
         intake = TaskIntake(
             text=text,
             channel_id=channel_id,
@@ -402,6 +409,131 @@ def drain_inbound(
     )
     return receipts
 
+
+
+
+def _follow_thread_id(
+    message: DiscordMessage,
+    thread_id: Optional[str],
+    orchestrator: Any,
+    job_pool: Optional[Any],
+) -> Optional[str]:
+    """Prefer an explicit thread, else a channel that is itself a live job thread."""
+
+    follow = (message.thread_id or thread_id or "").strip() or None
+    if follow:
+        return follow
+    channel = (message.channel_id or "").strip()
+    if channel and _thread_has_running_job(orchestrator, job_pool, channel):
+        return channel
+    return None
+
+
+def _running_run_id(orchestrator: Any, job_pool: Optional[Any], thread_id: str) -> Optional[str]:
+    tid = (thread_id or "").strip()
+    if not tid:
+        return None
+    finder = getattr(orchestrator, "running_run_for_thread", None)
+    if callable(finder):
+        try:
+            found = finder(tid)
+        except Exception:
+            found = None
+        if found:
+            return str(found)
+    if job_pool is not None:
+        finder = getattr(job_pool, "run_id_for_thread", None)
+        if callable(finder):
+            try:
+                found = finder(tid)
+            except Exception:
+                found = None
+            if found:
+                return str(found)
+    return None
+
+
+def _thread_has_running_job(
+    orchestrator: Any,
+    job_pool: Optional[Any],
+    thread_id: str,
+) -> bool:
+    if _running_run_id(orchestrator, job_pool, thread_id):
+        return True
+    if job_pool is None:
+        return False
+    probe = getattr(job_pool, "is_thread_live", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe(thread_id))
+    except Exception:
+        return False
+
+
+def _wait_for_run_id(
+    orchestrator: Any,
+    job_pool: Optional[Any],
+    thread_id: str,
+) -> Optional[str]:
+    found = _running_run_id(orchestrator, job_pool, thread_id)
+    if found:
+        return found
+    if job_pool is None:
+        return None
+    probe = getattr(job_pool, "is_thread_live", None)
+    if not callable(probe):
+        return None
+    try:
+        live = bool(probe(thread_id))
+    except Exception:
+        live = False
+    if not live:
+        return None
+    for _ in range(15):
+        time.sleep(0.02)
+        found = _running_run_id(orchestrator, job_pool, thread_id)
+        if found:
+            return found
+        try:
+            if not probe(thread_id):
+                break
+        except Exception:
+            break
+    return None
+
+
+def _post_steer_miss(discord: Any, channel_id: str, thread_id: Optional[str]) -> None:
+    try:
+        send = getattr(discord, "send_message", None)
+        if callable(send):
+            send(channel_id, "Could not steer this run.", thread_id=thread_id)
+    except Exception:
+        pass
+
+
+def _steer_running_job(
+    orchestrator: Any,
+    discord: Any,
+    job_pool: Optional[Any],
+    *,
+    text: str,
+    channel_id: str,
+    thread_id: str,
+) -> bool:
+    """Join the live worker. Never submit a sibling job."""
+
+    run_id = _wait_for_run_id(orchestrator, job_pool, thread_id)
+    steerer = getattr(orchestrator, "steer", None)
+    ok = False
+    if callable(steerer) and run_id:
+        try:
+            ok = bool(steerer(run_id, text))
+        except Exception:
+            ok = False
+    if not ok:
+        _post_steer_miss(discord, channel_id, thread_id)
+    return ok
 
 def _workspace_from(orchestrator: Any) -> Optional[Path]:
     raw = getattr(orchestrator, "workspace", None)

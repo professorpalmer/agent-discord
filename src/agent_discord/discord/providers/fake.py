@@ -40,6 +40,7 @@ class FakeDiscordMCPProvider:
     blobs: dict[str, bytes] = field(default_factory=dict)
     threads: dict[str, dict[str, str]] = field(default_factory=dict)
     persist_dir: Optional[Path] = None
+    reactions: list[dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.persist_dir is not None:
@@ -223,6 +224,16 @@ class FakeDiscordMCPProvider:
             "name": (name or "job")[:100],
         }
         return thread_id
+
+
+    def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        self.reactions.append(
+            {
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "emoji": emoji,
+            }
+        )
 
     def get_message(self, channel_id: str, message_id: str) -> DiscordMessage:
         for msg in (*self.sent, *self.inbox):

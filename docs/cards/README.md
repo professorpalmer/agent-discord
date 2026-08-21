@@ -4,7 +4,7 @@ One live card per job. That card lives in the **job thread**, not the channel.
 
 The moment an ask lands, Discord OS opens a thread on the user message and posts "On it." Then the worker starts. The channel stays free.
 
-Token flushes edit that same card. When the beat changes (or the job hits Done / Failed), the previous user-facing text is persisted as a normal thread message first (Hermes persist-then-settle). History survives edits. Do not settle "On it." / "Starting." / empty / percent-only / prompt-echo / host-reach dumps. Do not spam a new message per token.
+Token flushes edit that same card. When the beat changes (or the job hits Done / Failed), the previous user-facing text is persisted as a normal thread message first (Hermes persist-then-settle). History survives edits. A long public Done answer splits into 2–3 thread messages at sentence boundaries; the Done card can keep the first bubble and extras follow. Short answers stay one message. The parent-channel TLDR stays one line. Do not settle "On it." / "Starting." / empty / percent-only / prompt-echo / host-reach dumps. Do not spam a new message per token.
 
 Done is the actual user answer. Worker monologue ("Let me write the Discord answer", `report:`, host-reach dumps) never reaches Discord.
 

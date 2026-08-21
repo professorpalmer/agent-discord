@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.8
+
+Live-thread follow-ups steer the running worker. Long Done answers split; the channel gets one TLDR line.
+
+- A message in a live job thread calls `orchestrator.steer` instead of starting a sibling. Idle-thread follow-ups still start a new job.
+- Long public Done answers settle as 2–3 thread messages at sentence boundaries. Short answers stay one message.
+- Parent channel gets a one-line TLDR. Start and Done reactions land on the user message.
+- Public card text drops mid-sentence scaffolding and repeated bodies.
+
 ## 0.5.7
 
 README shots are the live HOST card plus a job thread, and two asks cooking.

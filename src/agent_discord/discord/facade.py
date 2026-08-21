@@ -180,6 +180,14 @@ class DiscordFacade:
             return str(method(channel_id, message_id, name) or "")
         raise ToolInvocationError("provider cannot start a thread")
 
+
+    def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        method = getattr(self.provider, "add_reaction", None)
+        if callable(method):
+            method(channel_id, message_id, emoji)
+            return
+        raise ToolInvocationError("provider cannot add a reaction")
+
     def download_attachment(
         self,
         channel_id: str,

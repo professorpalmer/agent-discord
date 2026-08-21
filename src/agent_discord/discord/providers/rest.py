@@ -7,6 +7,7 @@ from typing import Any, Mapping, Optional, Sequence
 from agent_discord.contracts import DiscordMessage, ToolDescriptor, ToolInvocationResult
 from agent_discord.discord.rest import (
     UrlOpener,
+    add_message_reaction,
     delete_channel_message,
     download_channel_attachment,
     edit_channel_message,
@@ -169,6 +170,16 @@ class RestDiscordProvider:
             channel_id=channel_id,
             message_id=message_id,
             name=name,
+            opener=self._opener,
+        )
+
+
+    def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        add_message_reaction(
+            token=self._bot_token,
+            channel_id=channel_id,
+            message_id=message_id,
+            emoji=emoji,
             opener=self._opener,
         )
 
