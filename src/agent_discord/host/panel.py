@@ -422,6 +422,11 @@ def handle_gateway_interaction(
     action = panel_action_from_interaction(payload)
     if action is None:
         return None
+    if action == "ask":
+        _ack_interaction(payload, ask_modal_payload(), opener=opener)
+        return action
+    _ack_interaction(payload, {"type": CALLBACK_DEFERRED_UPDATE}, opener=opener)
+
     from agent_discord.orchestration.service import (
         author_may_operate,
         seed_owner_if_empty,
@@ -437,27 +442,10 @@ def handle_gateway_interaction(
             flush=True,
         )
     if not author_may_operate(store, user_id, action, role_ids=role_ids):
-        _ack_interaction(
-            payload,
-            interaction_callback_payload(
-                _channel_armed(store, channel_id),
-                channel_id=channel_id,
-                store=store,
-            ),
-            opener=opener,
-        )
         return "denied"
-    if action == "ask":
-        _ack_interaction(payload, ask_modal_payload(), opener=opener)
-        return action
     if action == "halt":
         toggle_spend_halted(store)
     if action == "job":
-        _ack_interaction(
-            payload,
-            {"type": CALLBACK_DEFERRED_UPDATE},
-            opener=opener,
-        )
         try:
             _publish_job_card(store, channel_id, payload, token=token, opener=opener)
         except Exception as exc:
@@ -475,30 +463,18 @@ def handle_gateway_interaction(
     armed = _channel_armed(store, channel_id)
     if confirm_off:
         armed = True
-    _remember_panel_message(store, channel_id, payload)
-    acked = _ack_interaction(
-        payload,
-        interaction_callback_payload(
-            armed,
-            channel_id=channel_id,
+    try:
+        _paint_host_panel(
+            store,
+            channel_id,
+            token=token,
+            message_id=_remember_panel_message(store, channel_id, payload),
+            armed=armed,
             confirm_off=confirm_off,
-            store=store,
-        ),
-        opener=opener,
-    )
-    if not acked:
-        try:
-            _paint_host_panel(
-                store,
-                channel_id,
-                token=token,
-                message_id=_remember_panel_message(store, channel_id, payload),
-                armed=armed,
-                confirm_off=confirm_off,
-                opener=opener,
-            )
-        except Exception as exc:
-            print(f"panel paint failed: {exc}", flush=True)
+            opener=opener,
+        )
+    except Exception as exc:
+        print(f"panel paint failed: {exc}", flush=True)
     return action
 
 

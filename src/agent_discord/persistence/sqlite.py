@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -171,12 +172,13 @@ _PROMPT_MEMORY_BLOCK_CHARS = 1500
 class SQLiteStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
         self._fts_enabled = False
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connection()
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         conn.executescript(RESEARCH_SCHEMA)
         self._migrate_seen_messages(conn)
@@ -187,16 +189,19 @@ class SQLiteStore:
         conn.commit()
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def _connection(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path), timeout=30.0)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA busy_timeout=30000")
-        return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.path), timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     def _migrate_seen_messages(self, conn: sqlite3.Connection) -> None:
         cols = {
