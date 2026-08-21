@@ -54,20 +54,23 @@ def test_host_card_is_a_v2_panel():
     assert "idle" in body
     assert "acl" in body
     assert "open" in body
-    assert "Unpaired." in stopped.description
+    assert "writes" in body
+    assert "auto" in body
+    assert stopped.description == ""
     assert "<t:" in body
     assert CARD_FOOTER in body
     running = host_card(armed=True)
     assert running.title == "Running"
-    assert "Writes: Auto." in running.description
+    assert "writes" in _joined(running)
+    assert "auto" in _joined(running)
     realm = host_card(armed=True, realm="puppetmaster")
-    assert "Realm: puppetmaster." in realm.description
+    assert "puppetmaster" in _joined(realm)
     bank = host_card(armed=True, bank=True)
-    assert "think-tank memory" in bank.description
+    assert "bank" in _joined(bank)
     gated = host_card(armed=True, write_gate=True)
-    assert "Writes: Gate." in gated.description
+    assert "gate" in _joined(gated)
     paired = host_card(armed=True, paired=True, operator_count=1, role_count=2)
-    assert "Paired. 1 operator. 2 roles." in paired.description
+    assert "paired · 1 op · 2 roles" in _joined(paired)
     assert "Last:" not in paired.description
     with_job = host_card(armed=True, paired=True, last_job="Last: failed · boom")
     assert "Last: failed · boom" in with_job.description
@@ -195,3 +198,11 @@ def test_working_presence_name_and_status():
     long_name = working_presence("x" * 200)["d"]["activities"][0]["name"]
     assert long_name.startswith("Working on ")
     assert len(long_name) <= ACTIVITY_NAME_MAX
+
+
+def test_host_card_github_row():
+    card = host_card(armed=True, github="sign-in")
+    assert "github" in _joined(card)
+    assert "sign-in" in _joined(card)
+    ok = host_card(armed=True, github="ok")
+    assert "ok" in _joined(ok)

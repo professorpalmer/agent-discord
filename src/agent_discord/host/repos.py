@@ -15,6 +15,11 @@ from typing import Mapping, Optional, Sequence
 
 
 DEFAULT_PROJECTS_DIR = Path.home() / "Projects"
+HOST_PATH_PREFIXES = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    str(Path.home() / ".local" / "bin"),
+)
 _STATE_DIR_NAMES = frozenset({".agent-discord", "fake_discord"})
 _FOLDER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("puppetmaster", ("puppetmaster", "puppet master")),
@@ -94,6 +99,24 @@ def resolve_host_repo(
     return None
 
 
+def host_path(env: Optional[Mapping[str, str]] = None) -> str:
+    """LaunchAgents see a tiny PATH. Keep Homebrew ``gh`` visible to workers."""
+
+    current = ""
+    if env is not None:
+        current = str(env.get("PATH") or "")
+    else:
+        current = os.environ.get("PATH") or ""
+    parts = [item for item in HOST_PATH_PREFIXES if item]
+    parts.extend(item for item in current.split(":") if item)
+    return ":".join(dict.fromkeys(parts))
+
+
+def which_on_host(name: str, *, env: Optional[Mapping[str, str]] = None) -> str:
+    found = shutil.which(name, path=host_path(env))
+    return (found or "").strip()
+
+
 def host_reach_block(
     repos: Sequence[HostRepo],
     *,
@@ -102,7 +125,7 @@ def host_reach_block(
 ) -> str:
     """Tell the worker what this Mac can actually reach."""
 
-    gh = (gh_bin or shutil.which("gh") or "").strip()
+    gh = (gh_bin or which_on_host("gh") or "").strip()
     lines = [
         "Host reach (this Mac; Discord is only the remote):",
         "- Network: yes. Use gh, curl, and git.",

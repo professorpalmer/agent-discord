@@ -447,6 +447,29 @@ class SQLiteStore:
         )
         conn.commit()
 
+    def fail_stale_runs(self, *, reason: str = "host restarted") -> int:
+        """Mark leftover running rows failed. They cannot resume after a process death."""
+
+        conn = self._connection()
+        cur = conn.execute(
+            """
+            UPDATE runs
+            SET status=?, error=?, updated_at=datetime('now')
+            WHERE status IN ('running', 'progress', 'pending')
+            """,
+            (TaskStatus.FAILED.value, reason),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status=?, updated_at=datetime('now')
+            WHERE status IN ('running', 'progress', 'pending')
+            """,
+            (TaskStatus.FAILED.value,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
     def update_run(
         self,
         run_id: str,

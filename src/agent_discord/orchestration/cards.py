@@ -112,22 +112,12 @@ class CardMessage:
             children = [text_display(heading)]
         if self.kind == "HOST":
             live = self.title == "Running"
-            acl = "paired"
-            for name, value, _inline in self.fields:
-                if name == "acl":
-                    acl = value
-                    break
-            children.append(
-                text_display(
-                    status_table(
-                        (
-                            ("power", "on" if live else "off"),
-                            ("listen", "live" if live else "idle"),
-                            ("acl", acl),
-                        )
-                    )
-                )
-            )
+            table = [
+                ("power", "on" if live else "off"),
+                ("listen", "live" if live else "idle"),
+            ]
+            table.extend((name, value) for name, value, _inline in self.fields)
+            children.append(text_display(status_table(table)))
         body_parts: list[str] = []
         if self.description:
             body_parts.append(self.description)
@@ -435,89 +425,80 @@ def host_card(
     write_gate: bool = False,
     realm: str = "",
     bank: bool = False,
+    github: str = "",
 ) -> CardMessage:
     _ = channel_id
-    spend_line = _host_spend_line(spend_usd, cap_usd, halted)
-    acl_line = _host_acl_line(paired, operator_count, role_count)
-    fields: tuple[tuple[str, str, bool], ...] = (
-        ("acl", "paired" if paired else "open", True),
+    fields = _host_status_fields(
+        paired=paired,
+        operator_count=operator_count,
+        role_count=role_count,
+        write_gate=write_gate,
+        spend_usd=spend_usd,
+        cap_usd=cap_usd,
+        halted=halted,
+        realm=realm,
+        bank=bank,
+        github=github,
     )
     if confirm_off:
         return CardMessage(
             kind="HOST",
             title="Stop?",
-            description="Press Confirm to stop, or Cancel to keep running.",
+            description="Confirm to stop. Cancel keeps it running.",
             color=COLOR_WORK,
             avatar_url=avatar_url,
             fields=fields,
         )
-    realm_line = _host_realm_line(realm)
-    bank_line = _host_bank_line(bank)
-    if armed:
-        body = (
-            f"{acl_line}\n{_host_write_line(write_gate)}"
-            f"{realm_line}{bank_line}\n"
-            "Press Ask, Files, Terminal, or Browser. Off needs a confirm."
-        )
-        if spend_line:
-            body = f"{body}\n{spend_line}"
-        if last_job:
-            body = f"{body}\n{last_job}"
-        return CardMessage(
-            kind="HOST",
-            title="Halted" if halted else "Running",
-            description=body,
-            color=COLOR_FAIL if halted else COLOR_LIVE,
-            avatar_url=avatar_url,
-            fields=fields,
-        )
-    stopped = (
-        f"{acl_line}\n{_host_write_line(write_gate)}"
-        f"{realm_line}{bank_line}\nPress On to start."
-    )
-    if spend_line:
-        stopped = f"{stopped}\n{spend_line}"
-    if last_job:
-        stopped = f"{stopped}\n{last_job}"
     return CardMessage(
         kind="HOST",
-        title="Stopped",
-        description=stopped,
-        color=COLOR_IDLE,
+        title="Halted" if halted and armed else ("Running" if armed else "Stopped"),
+        description=last_job.strip(),
+        color=COLOR_FAIL if halted and armed else (COLOR_LIVE if armed else COLOR_IDLE),
         avatar_url=avatar_url,
         fields=fields,
     )
 
 
-def _host_acl_line(paired: bool, operator_count: int, role_count: int) -> str:
-    if not paired:
-        return "Unpaired. Press Pair."
-    ops = f"{max(0, int(operator_count))} operator"
-    if operator_count != 1:
-        ops += "s"
-    roles = f"{max(0, int(role_count))} role"
-    if role_count != 1:
-        roles += "s"
-    return f"Paired. {ops}. {roles}."
+def _host_status_fields(
+    *,
+    paired: bool,
+    operator_count: int,
+    role_count: int,
+    write_gate: bool,
+    spend_usd: float,
+    cap_usd: Optional[float],
+    halted: bool,
+    realm: str,
+    bank: bool,
+    github: str = "",
+) -> tuple[tuple[str, str, bool], ...]:
+    from agent_discord.orchestration.service import format_usd
 
-
-def _host_write_line(write_gate: bool) -> str:
-    if write_gate:
-        return "Writes: Gate. Press Auto to skip Approve."
-    return "Writes: Auto. Press Gate to require Approve."
-
-
-def _host_realm_line(realm: str) -> str:
+    acl = "open"
+    if paired:
+        ops = max(0, int(operator_count))
+        roles = max(0, int(role_count))
+        op_word = "op" if ops == 1 else "ops"
+        role_word = "role" if roles == 1 else "roles"
+        acl = f"paired · {ops} {op_word} · {roles} {role_word}"
+    rows: list[tuple[str, str, bool]] = [
+        ("acl", acl, True),
+        ("writes", "gate" if write_gate else "auto", True),
+    ]
+    spend = format_usd(spend_usd)
+    if cap_usd is not None:
+        spend = f"{spend} / {format_usd(cap_usd)}"
+    if halted:
+        spend = f"{spend} halt"
+    rows.append(("spend", spend, True))
     name = (realm or "").strip()
-    if not name:
-        return ""
-    return f"\nRealm: {name}."
-
-
-def _host_bank_line(bank: bool) -> str:
-    if not bank:
-        return ""
-    return "\nBank: this channel is think-tank memory."
+    if name:
+        rows.append(("realm", name, True))
+    if bank:
+        rows.append(("bank", "yes", True))
+    if github:
+        rows.append(("github", github, True))
+    return tuple(rows)
 
 
 def note_card(text: str, *, source_channel: str = "") -> CardMessage:
@@ -530,22 +511,6 @@ def note_card(text: str, *, source_channel: str = "") -> CardMessage:
         description=body or "Empty note.",
         color=COLOR_IDLE,
     )
-
-
-def _host_spend_line(
-    spend_usd: float,
-    cap_usd: Optional[float],
-    halted: bool,
-) -> str:
-    from agent_discord.orchestration.service import format_usd
-
-    line = f"Spend {format_usd(spend_usd)}"
-    if cap_usd is not None:
-        line += f" / {format_usd(cap_usd)}"
-    line += "."
-    if halted:
-        line += " Halted."
-    return line
 
 
 def render_overflow_card(

@@ -125,6 +125,46 @@ def test_parse_skips_task_id_echo_and_keeps_answer(tmp_path: Path):
     assert usable_worker_text("task_id=abc") == ""
 
 
+def test_github_ask_prompt_uses_host_gh_output():
+    text = _safe_dispatch_prompt(
+        DispatchRequest(
+            task_id="t1",
+            run_id="r1",
+            prompt="check open PRs and issues",
+            model="openrouter/auto",
+            context=ContextSnapshot(task_id="t1", memories=[], bindings={}),
+            metadata={"host_github": "Open PRs:\n#12 docs drift"},
+        )
+    )
+    assert "Host already queried GitHub" in text
+    assert "#12 docs drift" in text
+    assert "Named git checkouts" not in text
+
+
+def test_prose_tokens_join_as_a_paragraph():
+    buffer = TokenStreamBuffer()
+    first = _event_from_cli_line("The", "openrouter/auto", buffer)
+    second = _event_from_cli_line("checkout", "openrouter/auto", buffer)
+    third = _event_from_cli_line("has no open PRs.", "openrouter/auto", buffer)
+    assert first is not None and second is not None and third is not None
+    assert "The checkout has no open PRs." in str(third.summary.details["token_text"])
+    assert "The\ncheckout" not in str(third.summary.details["token_text"])
+
+
+def test_choose_spoken_answer_skips_host_reach_echo():
+    from agent_discord.puppetmaster.backend import choose_spoken_answer, is_prompt_echo
+
+    dump = (
+        "Network: yes. Use gh, curl, and git.\n"
+        "Named git checkouts:\n"
+        "Host tools (CLI or HTTP — not MCP inside Discord):\n"
+        "Think-tank (Discord is the durable store):\n"
+        "Do not treat .agent-discord as the subject repository.\n"
+    )
+    assert is_prompt_echo(dump)
+    assert choose_spoken_answer(dump, "Open PRs: none.") == "Open PRs: none."
+
+
 def test_prose_cli_line_becomes_token_stream():
     buffer = TokenStreamBuffer()
     event = _event_from_cli_line(
@@ -321,6 +361,7 @@ def test_cli_stream_yields_token_progress_from_popen(monkeypatch, tmp_path: Path
         captured.setdefault("cmds", []).append(list(proc.args))
         return proc
 
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(tmp_path / "pm-state"))
     monkeypatch.setattr(
         "agent_discord.puppetmaster.backend.shutil.which",
         lambda _: "/usr/bin/puppetmaster",
@@ -342,6 +383,10 @@ def test_cli_stream_yields_token_progress_from_popen(monkeypatch, tmp_path: Path
     worker = next(cmd for cmd in captured["cmds"] if "cursor" in cmd)
     assert "--json-lines" not in worker
     assert "--emit-job-id-early" in worker
+    assert "--state-dir" in worker
+    follower = next(cmd for cmd in captured["cmds"] if "deltas" in cmd)
+    assert "--state-dir" in follower
+    assert str(tmp_path / "pm-state") in follower
     assert any("deltas" in cmd for cmd in captured["cmds"])
     token_events = [event for event in events if event.summary.details.get("token")]
     assert token_events
@@ -395,5 +440,5 @@ def test_agentic_stream_passes_json_lines_and_parses_tokens(monkeypatch, tmp_pat
     worker = next(cmd for cmd in captured["cmds"] if "agentic" in cmd)
     assert "--json-lines" not in worker
     assert "--emit-job-id-early" in worker
-    assert "--worker-mode" in worker
+    assert worker[worker.index("--worker-mode") + 1] == "inline"
     assert any(event.summary.details.get("token") for event in events)

@@ -64,12 +64,34 @@ def _is_token_stream(details: Mapping[str, Any]) -> bool:
 
 
 def _visible_card_text(text: str) -> str:
-    from agent_discord.puppetmaster.backend import usable_worker_text
+    """Keep model dialogue on the live card. Drop only CLI/JSON junk."""
 
-    raw = (text or "").strip()
-    if raw[:1] in "{[":
+    from agent_discord.puppetmaster.backend import is_prompt_echo, public_card_text
+
+    cleaned = public_card_text(text)
+    if not cleaned:
         return ""
-    return usable_worker_text(raw)
+    if is_prompt_echo(cleaned):
+        return ""
+    text = cleaned
+    kept: list[str] = []
+    for line in (text or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if raw[:1] in "{[":
+            continue
+        lower = raw.lower()
+        if lower.startswith("usage: puppetmaster"):
+            continue
+        if "unrecognized arguments:" in lower:
+            continue
+        if lower.startswith(("task_id=", "run_id=", "job_id:")):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept).strip()
 
 
 def _strip_prompt_section(block: str, heading: str) -> str:
@@ -87,6 +109,101 @@ def _strip_prompt_section(block: str, heading: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept).strip()
+
+
+
+_SETTLE_SKIP = frozenset(
+    {
+        "starting.",
+        "starting",
+        "on it.",
+        "on it",
+        "working.",
+        "working",
+        "queued.",
+        "queued",
+    }
+)
+
+
+def _is_settle_worthy(text: str) -> bool:
+    from agent_discord.puppetmaster.backend import public_card_text
+
+    raw = public_card_text(text).strip()
+    if not raw:
+        return False
+    if raw.lower() in _SETTLE_SKIP:
+        return False
+    compact = raw.replace("%", "").replace(".", "").replace(" ", "")
+    if compact.isdigit():
+        return False
+    return True
+
+
+class _LiveCard:
+    """One editable card. Persist-then-settle on beat change / Done."""
+
+    def __init__(
+        self,
+        orch: "AgentOrchestrator",
+        channel_id: str,
+        thread_id: Optional[str],
+        run_id: str,
+    ) -> None:
+        self.orch = orch
+        self.channel_id = channel_id
+        self.thread_id = thread_id
+        self.run_id = run_id
+        self.message_id: Optional[str] = None
+        self.stage = ""
+        self.text = ""
+
+    def paint(self, card: Any, *, stage: str, settle: bool = False) -> None:
+        from agent_discord.puppetmaster.backend import public_card_text
+
+        new_text = public_card_text(getattr(card, "description", "") or "")
+        should = False
+        if self.thread_id and self.text:
+            if settle:
+                should = True
+            elif stage and self.stage and stage != self.stage:
+                should = True
+        if should:
+            self.orch._settle_beat(self.channel_id, self.thread_id, self.text)
+        self.message_id = self.orch._post_or_edit_progress(
+            self.channel_id,
+            card,
+            thread_id=self.thread_id,
+            message_id=self.message_id,
+        )
+        if stage:
+            self.stage = stage
+        if new_text:
+            self.text = new_text
+
+    def finish(self, card: Any, *, summary: str) -> None:
+        from agent_discord.puppetmaster.backend import public_card_text
+
+        if self.orch.discord is None:
+            return
+        if self.thread_id:
+            if _is_settle_worthy(self.text):
+                self.orch._settle_beat(self.channel_id, self.thread_id, self.text)
+            spoken = public_card_text(summary)
+            if (
+                spoken
+                and spoken != public_card_text(self.text)
+                and _is_settle_worthy(spoken)
+            ):
+                self.orch._settle_beat(self.channel_id, self.thread_id, spoken)
+        dest = self.thread_id or self.channel_id
+        if self.message_id:
+            try:
+                edit_card(self.orch.discord, dest, self.message_id, card)
+                return
+            except Exception:
+                pass
+        send_card(self.orch.discord, self.channel_id, card, thread_id=self.thread_id)
 
 
 class AgentOrchestrator:
@@ -119,6 +236,7 @@ class AgentOrchestrator:
         self.workspace = Path(workspace) if workspace is not None else None
         self.compute_cwd = Path(compute_cwd) if compute_cwd is not None else None
         self.host_repos = host_repos
+        self.host_github: Optional[Callable[[Path], str]] = None
         self.retry_backoff_s = float(retry_backoff_s)
         self.presence = presence
         self._run_status: dict[str, TaskStatus] = {}
@@ -165,6 +283,34 @@ class AgentOrchestrator:
         )
         self._run_status[run_id] = TaskStatus.RUNNING
         self._set_presence("dnd", intake.text)
+
+        job_thread_id = intake.thread_id
+        if (
+            self.post_progress_to_discord
+            and self.discord is not None
+            and intake.message_id
+            and not intake.thread_id
+        ):
+            started = self._start_job_thread(
+                intake.channel_id, intake.message_id, intake.text
+            )
+            if started:
+                job_thread_id = started
+        if job_thread_id:
+            from agent_discord.orchestration.jobs import note_origin_thread
+
+            note_origin_thread(job_thread_id)
+        live = _LiveCard(self, intake.channel_id, job_thread_id, run_id)
+        if self.post_progress_to_discord and self.discord is not None:
+            live.paint(
+                progress_card(
+                    stage="start",
+                    message="On it.",
+                    percent=1,
+                    run_id=run_id,
+                ),
+                stage="start",
+            )
 
         if intake.message_id:
             self.store.bind_inbound_message(
@@ -267,8 +413,7 @@ class AgentOrchestrator:
         )
 
         progress_items: list[ProgressSummary] = []
-        progress_message_id: Optional[str] = None
-        job_thread_id = intake.thread_id
+        progress_message_id = live.message_id
         requested_workers = None
         thread_history = ""
         if intake.metadata:
@@ -308,6 +453,30 @@ class AgentOrchestrator:
             extra_meta["cwd"] = str(run_cwd)
         if chosen is not None:
             extra_meta["repo"] = chosen.name
+        from agent_discord.host.github import is_github_status_ask
+
+        host_github = ""
+        if (
+            callable(self.host_github)
+            and is_github_status_ask(intake.text)
+            and run_cwd is not None
+        ):
+            try:
+                host_github = str(self.host_github(Path(run_cwd)) or "").strip()
+            except Exception:
+                host_github = ""
+        if host_github:
+            extra_meta["host_github"] = host_github
+        from agent_discord.host.github import is_github_unauthed_report
+
+        if is_github_status_ask(intake.text) and is_github_unauthed_report(host_github):
+            return self._close_without_worker(
+                intake,
+                task_id=task_id,
+                run_id=run_id,
+                summary=host_github,
+                live=live,
+            )
         extra_meta["host_reach"] = "\n\n".join(
             item
             for item in (
@@ -335,25 +504,21 @@ class AgentOrchestrator:
             context=snapshot,
             metadata=extra_meta,
         )
-        if self.post_progress_to_discord and self.discord is not None:
-            start_card = progress_card(
-                stage="start",
-                message="Starting.",
-                percent=1,
-                run_id=run_id,
-            )
-            progress_message_id = self._post_or_edit_progress(
-                intake.channel_id,
-                start_card,
-                thread_id=job_thread_id,
-                message_id=None,
-            )
-            if progress_message_id and not job_thread_id:
-                job_thread_id = self._start_job_thread(
-                    intake.channel_id,
-                    progress_message_id,
-                    intake.text,
+        if host_github and not is_github_unauthed_report(host_github):
+            from agent_discord.puppetmaster.backend import public_card_text
+
+            shown = public_card_text(host_github[:TOKEN_TEXT_LIMIT])
+            if shown:
+                live.paint(
+                    progress_card(
+                        stage="working",
+                        message=shown,
+                        percent=12,
+                        run_id=run_id,
+                    ),
+                    stage="working",
                 )
+                progress_message_id = live.message_id
         if workers:
             return self.dispatch_swarm(
                 intake,
@@ -363,6 +528,7 @@ class AgentOrchestrator:
                 workers=workers,
                 job_thread_id=job_thread_id,
                 progress_message_id=progress_message_id,
+                live=live,
             )
         stream = getattr(self.backend, "stream", None)
         if callable(stream):
@@ -372,35 +538,50 @@ class AgentOrchestrator:
             result = self.backend.dispatch(request)
             events_iter = iter(result.events)
 
-        token_text = ""
-        token_dirty = False
+        token_text = host_github[-TOKEN_TEXT_LIMIT:] if host_github else ""
+        token_dirty = bool(token_text)
         last_flush_at = _monotonic()
         last_percent: Optional[float] = None
         stream_stage = "start"
         stream_error: Optional[str] = None
+        painted_live = False
 
         def flush_token_card(*, force: bool = False) -> None:
-            nonlocal progress_message_id, token_dirty, last_flush_at
-            visible = _visible_card_text(token_text)
-            if not token_dirty or not visible:
+            nonlocal progress_message_id, token_dirty, last_flush_at, painted_live
+            from agent_discord.puppetmaster.backend import is_prompt_echo
+
+            visible = redact_text_markers(token_text).strip()
+            if is_prompt_echo(visible):
+                visible = ""
+            if not token_dirty and not force:
                 return
-            if not force and (_monotonic() - last_flush_at) < TOKEN_CARD_FLUSH_SECONDS:
+            if not visible and not force and last_percent is None:
+                return
+            first_tokens = bool(visible) and not painted_live
+            if (
+                not force
+                and not first_tokens
+                and (_monotonic() - last_flush_at) < TOKEN_CARD_FLUSH_SECONDS
+            ):
                 return
             if self.post_progress_to_discord and self.discord is not None:
-                card = progress_card(
+                from agent_discord.puppetmaster.backend import public_card_text
+
+                shown = public_card_text(visible) or "Working."
+                live.paint(
+                    progress_card(
+                        stage=stream_stage,
+                        message=shown,
+                        percent=last_percent,
+                        run_id=run_id,
+                    ),
                     stage=stream_stage,
-                    message=visible,
-                    percent=last_percent,
-                    run_id=run_id,
                 )
-                progress_message_id = self._post_or_edit_progress(
-                    intake.channel_id,
-                    card,
-                    thread_id=job_thread_id,
-                    message_id=progress_message_id,
-                )
+                progress_message_id = live.message_id
             token_dirty = False
             last_flush_at = _monotonic()
+            if visible:
+                painted_live = True
 
         for event in events_iter:
             safe_details = strip_forbidden_keys(dict(event.summary.details))
@@ -438,13 +619,33 @@ class AgentOrchestrator:
             ):
                 if summary.percent is not None:
                     last_percent = summary.percent
+                if (summary.message or "").strip().lower().startswith("dispatched via"):
+                    if last_percent is not None:
+                        live.paint(
+                            progress_card(
+                                stage="working",
+                                message=_visible_card_text(token_text) or "Working.",
+                                percent=last_percent,
+                                run_id=run_id,
+                            ),
+                            stage="working",
+                        )
+                        progress_message_id = live.message_id
+                    continue
                 if _is_token_stream(summary.details):
-                    incoming = str(summary.details.get("token_text") or "")
+                    from agent_discord.puppetmaster.backend import is_prompt_echo
+
+                    from agent_discord.puppetmaster.backend import public_card_text
+
+                    incoming = public_card_text(str(summary.details.get("token_text") or ""))
                     if incoming:
                         token_text = incoming[-TOKEN_TEXT_LIMIT:]
-                    elif summary.message:
-                        token_text = (token_text + summary.message)[-TOKEN_TEXT_LIMIT:]
-                    token_dirty = True
+                        token_dirty = True
+                    else:
+                        spoken_bit = public_card_text(summary.message or "")
+                        if spoken_bit:
+                            token_text = (token_text + spoken_bit)[-TOKEN_TEXT_LIMIT:]
+                            token_dirty = True
                     phase = str(
                         summary.details.get("stream_phase") or summary.stage or stream_stage
                     )
@@ -457,18 +658,16 @@ class AgentOrchestrator:
                     continue
                 if summary.stage:
                     stream_stage = summary.stage
-                card = progress_card(
-                    stage=summary.stage,
-                    message=visible,
-                    percent=summary.percent,
-                    run_id=run_id,
+                live.paint(
+                    progress_card(
+                        stage=summary.stage,
+                        message=visible,
+                        percent=summary.percent,
+                        run_id=run_id,
+                    ),
+                    stage=summary.stage or stream_stage,
                 )
-                progress_message_id = self._post_or_edit_progress(
-                    intake.channel_id,
-                    card,
-                    thread_id=job_thread_id,
-                    message_id=progress_message_id,
-                )
+                progress_message_id = live.message_id
                 last_flush_at = _monotonic()
 
         flush_token_card(force=True)
@@ -537,15 +736,29 @@ class AgentOrchestrator:
             }
             self._record_usage_spend(intake.workspace_id, run_id, result.usage)
 
-        from agent_discord.puppetmaster.backend import (
-            _is_placeholder_summary,
-            usable_worker_text,
-        )
+        from agent_discord.puppetmaster.backend import choose_spoken_answer
 
-        spoken = usable_worker_text(redact_text_markers(result.final_summary))
-        if not spoken or _is_placeholder_summary(spoken):
-            spoken = usable_worker_text(token_text) or spoken
-        spoken = _visible_card_text(spoken) or spoken
+        progress_bits = tuple(
+            item.message
+            for item in progress_items
+            if item.stage in {"thinking", "plan", "code", "done"}
+        )
+        spoken = choose_spoken_answer(
+            token_text,
+            *reversed(progress_bits),
+            result.final_summary,
+        )
+        if not spoken:
+            from agent_discord.host.github import is_github_unauthed_report
+            from agent_discord.puppetmaster.backend import public_card_text
+
+            spoken = public_card_text(token_text)
+            if (
+                not spoken
+                and is_github_status_ask(intake.text)
+                and is_github_unauthed_report(host_github)
+            ):
+                spoken = host_github
         safe_final_summary = spoken or "Worker finished without a written answer."
         safe_error = redact_text_markers(result.error) if result.error else None
         self.store.update_run(
@@ -557,13 +770,16 @@ class AgentOrchestrator:
         )
         self._run_status[run_id] = result.status
 
-        self.store.remember(
-            workspace_id=intake.workspace_id,
-            channel_id=intake.channel_id,
-            content=f"task:{intake.text[:240]} → {safe_final_summary[:240]}",
-            source="orchestrator",
-            provenance={"task_id": task_id, "run_id": run_id, "status": result.status.value},
-        )
+        from agent_discord.puppetmaster.backend import is_prompt_echo
+
+        if spoken and not is_prompt_echo(safe_final_summary):
+            self.store.remember(
+                workspace_id=intake.workspace_id,
+                channel_id=intake.channel_id,
+                content=f"{intake.text[:160]} → {safe_final_summary[:240]}",
+                source="orchestrator",
+                provenance={"task_id": task_id, "run_id": run_id, "status": result.status.value},
+            )
         if self.discord is not None and result.status == TaskStatus.COMPLETED:
             try:
                 settle_think_tank(
@@ -598,18 +814,11 @@ class AgentOrchestrator:
         )
 
         if self.post_progress_to_discord and self.discord is not None:
-            if progress_message_id:
-                try:
-                    edit_card(
-                        self.discord,
-                        intake.channel_id,
-                        progress_message_id,
-                        card,
-                    )
-                except Exception:
-                    send_card(self.discord, intake.channel_id, card)
-            else:
-                send_card(self.discord, intake.channel_id, card)
+            live.finish(card, summary=safe_final_summary)
+        if live.thread_id:
+            from agent_discord.orchestration.jobs import drop_origin_thread
+
+            drop_origin_thread(live.thread_id)
         self._set_presence("idle", "Discord OS")
 
         return receipt
@@ -624,9 +833,13 @@ class AgentOrchestrator:
         workers: int,
         job_thread_id: Optional[str],
         progress_message_id: Optional[str],
+        live: Optional[_LiveCard] = None,
     ) -> RunReceipt:
         """Fan out one analyze worker per role, then optional implement handoff."""
 
+        if live is None:
+            live = _LiveCard(self, intake.channel_id, job_thread_id, run_id)
+            live.message_id = progress_message_id
         roles = list(_SWARM_ROLES[: max(2, min(int(workers), 5))])
         summaries: list[str] = []
         progress_items: list[ProgressSummary] = []
@@ -651,17 +864,16 @@ class AgentOrchestrator:
                 )
             )
             if self.post_progress_to_discord and self.discord is not None:
-                progress_message_id = self._post_or_edit_progress(
-                    intake.channel_id,
+                live.paint(
                     progress_card(
                         stage=role,
                         message=bit,
                         percent=progress_items[-1].percent,
                         run_id=run_id,
                     ),
-                    thread_id=job_thread_id,
-                    message_id=progress_message_id,
+                    stage=role,
                 )
+                progress_message_id = live.message_id
 
         stitched = "\n".join(summaries)
         final_status = TaskStatus.COMPLETED
@@ -696,14 +908,7 @@ class AgentOrchestrator:
             error=handoff_error,
         )
         if self.post_progress_to_discord and self.discord is not None:
-            card = receipt_card(receipt)
-            if progress_message_id:
-                try:
-                    edit_card(self.discord, intake.channel_id, progress_message_id, card)
-                except Exception:
-                    send_card(self.discord, intake.channel_id, card)
-            else:
-                send_card(self.discord, intake.channel_id, card)
+            live.finish(receipt_card(receipt), summary=redact_text_markers(stitched))
         self._event(
             task_id,
             run_id,
@@ -1095,6 +1300,60 @@ class AgentOrchestrator:
             ],
         }
 
+    def _settle_beat(
+        self,
+        channel_id: str,
+        thread_id: Optional[str],
+        text: str,
+    ) -> None:
+        if self.discord is None or not thread_id:
+            return
+        from agent_discord.puppetmaster.backend import public_card_text
+
+        body = public_card_text(text).strip()
+        if not _is_settle_worthy(body):
+            return
+        poster = getattr(self.discord, "send_message", None)
+        if not callable(poster):
+            return
+        try:
+            poster(channel_id, body, thread_id=thread_id)
+        except TypeError:
+            try:
+                poster(channel_id, body)
+            except Exception:
+                return
+        except Exception:
+            return
+
+    def _close_without_worker(
+        self,
+        intake: TaskIntake,
+        *,
+        task_id: str,
+        run_id: str,
+        summary: str,
+        live: _LiveCard,
+    ) -> RunReceipt:
+        from agent_discord.puppetmaster.backend import public_card_text
+
+        spoken = public_card_text(summary) or summary.strip() or "Done."
+        try:
+            self.store.update_run(run_id, status=TaskStatus.COMPLETED, summary=spoken)
+        except Exception:
+            pass
+        self._run_status[run_id] = TaskStatus.COMPLETED
+        receipt = RunReceipt(
+            task_id=task_id,
+            run_id=run_id,
+            status=TaskStatus.COMPLETED,
+            summary=spoken,
+        )
+        if self.post_progress_to_discord and self.discord is not None:
+            live.finish(receipt_card(receipt), summary=spoken)
+        self._set_presence("idle", "Discord OS")
+        return receipt
+
     def _start_job_thread(
         self,
         channel_id: str,
@@ -1123,9 +1382,10 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         if self.discord is None:
             return message_id
+        dest = thread_id or channel_id
         if message_id:
             try:
-                edited = edit_card(self.discord, channel_id, message_id, card)
+                edited = edit_card(self.discord, dest, message_id, card)
                 return edited.message_id or message_id
             except Exception:
                 return message_id

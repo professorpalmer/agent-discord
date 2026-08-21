@@ -15,6 +15,7 @@ ASK_ID = "discord-os:ask"
 ASK_MODAL_ID = "discord-os:ask-modal"
 ASK_TEXT_ID = "discord-os:ask-text"
 JOBS_ID = "discord-os:jobs"
+MORE_ID = "discord-os:more"
 PAIR_ID = "discord-os:pair"
 HALT_ID = "discord-os:halt"
 GATE_ID = "discord-os:gate"
@@ -26,6 +27,7 @@ TERMINAL_ID = "discord-os:terminal"
 BROWSER_ID = "discord-os:browser"
 BROWSER_MODAL_ID = "discord-os:browser-modal"
 BROWSER_TEXT_ID = "discord-os:browser-text"
+GITHUB_ID = "discord-os:github"
 COMPONENT_ROW = 1
 BUTTON = 2
 STYLE_PRIMARY = 1
@@ -93,69 +95,93 @@ def host_panel_components(
                     "label": "Ask",
                 }
             )
-        rows = [
-            {"type": COMPONENT_ROW, "components": power},
-            {
-                "type": COMPONENT_ROW,
-                "components": [
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_PRIMARY,
-                        "custom_id": PAIR_ID,
-                        "label": "Paired" if paired else "Pair",
-                        "disabled": bool(paired),
-                    },
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_DANGER,
-                        "custom_id": HALT_ID,
-                        "label": "Halt",
-                    },
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_DANGER if write_gate else STYLE_SUCCESS,
-                        "custom_id": GATE_ID,
-                        "label": "Gate" if write_gate else "Auto",
-                    },
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_SECONDARY,
-                        "custom_id": ROLES_ID,
-                        "label": "Roles",
-                    },
-                ],
-            },
-        ]
-        if armed:
+        rows = [{"type": COMPONENT_ROW, "components": power}]
+        more = _more_select_options(
+            armed=armed,
+            paired=paired,
+            write_gate=write_gate,
+        )
+        if more:
             rows.append(
-                {
-                    "type": COMPONENT_ROW,
-                    "components": [
-                        {
-                            "type": BUTTON,
-                            "style": STYLE_SECONDARY,
-                            "custom_id": FILES_ID,
-                            "label": "Files",
-                        },
-                        {
-                            "type": BUTTON,
-                            "style": STYLE_SECONDARY,
-                            "custom_id": TERMINAL_ID,
-                            "label": "Terminal",
-                        },
-                        {
-                            "type": BUTTON,
-                            "style": STYLE_SECONDARY,
-                            "custom_id": BROWSER_ID,
-                            "label": "Browser",
-                        },
-                    ],
-                }
+                action_row(
+                    [string_select(MORE_ID, more, placeholder="More")]
+                )
             )
     options = _job_select_options(jobs or ())
     if options:
         rows.append(action_row([string_select(JOBS_ID, options)]))
     return rows
+
+
+def _more_select_options(
+    *,
+    armed: bool,
+    paired: bool,
+    write_gate: bool,
+) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    if not paired:
+        options.append(
+            {
+                "label": "Pair",
+                "value": PAIR_ID,
+                "description": "First click becomes owner",
+            }
+        )
+    options.append(
+        {"label": "Halt", "value": HALT_ID, "description": "Stop new jobs"}
+    )
+    if write_gate:
+        options.append(
+            {
+                "label": "Auto writes",
+                "value": GATE_ID,
+                "description": "Skip Approve",
+            }
+        )
+    else:
+        options.append(
+            {
+                "label": "Gate writes",
+                "value": GATE_ID,
+                "description": "Require Approve",
+            }
+        )
+    options.append(
+        {
+            "label": "Roles",
+            "value": ROLES_ID,
+            "description": "Add an operator role",
+        }
+    )
+    options.append(
+        {
+            "label": "GitHub",
+            "value": GITHUB_ID,
+            "description": "Host gh sign-in",
+        }
+    )
+    if armed:
+        options.extend(
+            [
+                {
+                    "label": "Files",
+                    "value": FILES_ID,
+                    "description": "Open the folder on this Mac",
+                },
+                {
+                    "label": "Terminal",
+                    "value": TERMINAL_ID,
+                    "description": "Open a shell on this Mac",
+                },
+                {
+                    "label": "Browser",
+                    "value": BROWSER_ID,
+                    "description": "Open Chromium on this Mac",
+                },
+            ]
+        )
+    return options
 
 
 def _job_select_options(jobs: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[dict[str, str]]:
@@ -244,6 +270,18 @@ def ask_text_from_interaction(payload: Mapping[str, Any]) -> str:
     return _first_text_input(data.get("components"))
 
 
+def selected_more_id(payload: Mapping[str, Any]) -> str:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return ""
+    if str(data.get("custom_id") or "") != MORE_ID:
+        return ""
+    values = data.get("values")
+    if not isinstance(values, list) or not values:
+        return ""
+    return str(values[0] or "").strip()
+
+
 def selected_job_id(payload: Mapping[str, Any]) -> str:
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -300,6 +338,8 @@ def host_panel_payload(
     operator_count = 0
     role_count = 0
     last_job = ""
+    realm = ""
+    bank = False
     if store is not None:
         try:
             spend_usd = session_spend_usd(store)
@@ -314,6 +354,8 @@ def host_panel_payload(
         paired = _panel_paired(store)
         operator_count, role_count = _panel_acl_counts(store)
         last_job = _panel_last_job(store, channel_id)
+        realm = _panel_realm(store, channel_id)
+        bank = _panel_bank(store, channel_id)
     card = host_card(
         armed=armed,
         channel_id=channel_id,
@@ -327,6 +369,9 @@ def host_panel_payload(
         role_count=role_count,
         last_job=last_job,
         write_gate=write_gate,
+        realm=realm,
+        bank=bank,
+        github=_panel_github(),
     )
     return card.v2_payload(
         rows=host_panel_components(
@@ -353,6 +398,8 @@ def panel_action_from_custom_id(custom_id: str) -> Optional[str]:
         return "ask"
     if raw == JOBS_ID:
         return "job"
+    if raw == MORE_ID:
+        return None
     if raw == PAIR_ID:
         return "pair"
     if raw == HALT_ID:
@@ -367,6 +414,8 @@ def panel_action_from_custom_id(custom_id: str) -> Optional[str]:
         return "terminal"
     if raw == BROWSER_ID:
         return "browser"
+    if raw == GITHUB_ID:
+        return "github"
     return None
 
 
@@ -376,7 +425,10 @@ def panel_action_from_interaction(payload: Mapping[str, Any]) -> Optional[str]:
     data = payload.get("data")
     if not isinstance(data, dict):
         return None
-    return panel_action_from_custom_id(str(data.get("custom_id") or ""))
+    custom_id = str(data.get("custom_id") or "")
+    if custom_id == MORE_ID:
+        return panel_action_from_custom_id(selected_more_id({"data": data}))
+    return panel_action_from_custom_id(custom_id)
 
 
 def apply_panel_action(store: Any, channel_id: str, action: str) -> dict[str, Any]:
@@ -779,6 +831,36 @@ def _panel_last_job(store: Any, channel_id: str) -> str:
     if text:
         return f"Last: {text}"
     return ""
+
+
+def _panel_realm(store: Any, channel_id: str) -> str:
+    reader = getattr(store, "get_binding", None)
+    if not callable(reader):
+        return ""
+    try:
+        from agent_discord.host.realms import binding_metadata
+
+        return str(binding_metadata(reader("default", channel_id)).get("repo") or "")
+    except Exception:
+        return ""
+
+
+def _panel_bank(store: Any, channel_id: str) -> bool:
+    try:
+        from agent_discord.host.memory import channel_is_memory
+
+        return bool(channel_is_memory(store, channel_id))
+    except Exception:
+        return False
+
+
+def _panel_github() -> str:
+    try:
+        from agent_discord.host.github import github_host_row
+
+        return github_host_row()
+    except Exception:
+        return "sign-in"
 
 
 def _panel_paired(store: Any) -> bool:

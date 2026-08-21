@@ -384,6 +384,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_spend.add_argument("--resume", action="store_true")
     p_spend.add_argument("--json", action="store_true")
 
+    p_add = sub.add_parser(
+        "add",
+        help="Wire one workflow seam (realm, memory, repo, wiki, tool, github). Not a wizard.",
+    )
+    add_sub = p_add.add_subparsers(dest="add_command", required=True)
+    p_add_realm = add_sub.add_parser("realm", help="Bind a Discord channel to a named checkout")
+    p_add_realm.add_argument("name")
+    p_add_realm.add_argument("--channel-id", required=True)
+    p_add_realm.add_argument("--workspace-id", default="default")
+    p_add_realm.add_argument("--json", action="store_true")
+    p_add_memory = add_sub.add_parser("memory", help="Mark a channel as think-tank")
+    p_add_memory.add_argument("--channel-id", required=True)
+    p_add_memory.add_argument("--workspace-id", default="default")
+    p_add_memory.add_argument("--json", action="store_true")
+    p_add_repo = add_sub.add_parser("repo", help="Name a git checkout this host can reach")
+    p_add_repo.add_argument("name")
+    p_add_repo.add_argument("--path", required=True, type=Path)
+    p_add_repo.add_argument("--json", action="store_true")
+    p_add_wiki = add_sub.add_parser("wiki", help="Point wiki HTTP at a base URL and token")
+    p_add_wiki.add_argument("--url", default="")
+    p_add_wiki.add_argument("--token", default="")
+    p_add_wiki.add_argument("--json", action="store_true")
+    p_add_tool = add_sub.add_parser("tool", help="Name a host CLI or HTTP tool")
+    p_add_tool.add_argument("name")
+    p_add_tool.add_argument("--bin", default="")
+    p_add_tool.add_argument("--url", default="")
+    p_add_tool.add_argument("--hint", default="")
+    p_add_tool.add_argument("--json", action="store_true")
+    p_add_github = add_sub.add_parser(
+        "github",
+        help="Sign this host into GitHub (GH_TOKEN in host .env)",
+    )
+    p_add_github.add_argument("--token", default="", help="GitHub token (or use gh auth login)")
+    p_add_github.add_argument("--json", action="store_true")
+    p_add_list = add_sub.add_parser("list", help="Show wired realms, memory, wiki, and tools")
+    p_add_list.add_argument("--workspace-id", default="default")
+    p_add_list.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -554,6 +592,115 @@ def cmd_schedule(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         print(f"scheduled {schedule_id} every {every_s}s", file=out)
     finally:
         store.close()
+    return 0
+
+
+def cmd_add(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.host.add import (
+        add_github,
+        add_memory,
+        add_realm,
+        add_repo,
+        add_tool,
+        add_wiki,
+        list_added,
+    )
+
+    command = getattr(args, "add_command", None)
+    try:
+        if command == "list":
+            config = load_config()
+            store = SQLiteStore(config.database_path)
+            store.initialize()
+            try:
+                payload = list_added(store, workspace_id=args.workspace_id)
+            finally:
+                store.close()
+        elif command == "realm":
+            config = load_config()
+            store = SQLiteStore(config.database_path)
+            store.initialize()
+            try:
+                payload = add_realm(
+                    store,
+                    name=args.name,
+                    channel_id=args.channel_id,
+                    workspace_id=args.workspace_id,
+                )
+            finally:
+                store.close()
+        elif command == "memory":
+            config = load_config()
+            store = SQLiteStore(config.database_path)
+            store.initialize()
+            try:
+                payload = add_memory(
+                    store,
+                    channel_id=args.channel_id,
+                    workspace_id=args.workspace_id,
+                )
+            finally:
+                store.close()
+        elif command == "repo":
+            payload = add_repo(name=args.name, path=args.path)
+        elif command == "wiki":
+            payload = add_wiki(url=args.url, token=args.token)
+        elif command == "tool":
+            payload = add_tool(
+                name=args.name,
+                bin=args.bin,
+                url=args.url,
+                hint=args.hint,
+            )
+        elif command == "github":
+            payload = add_github(token=getattr(args, "token", "") or "")
+        else:
+            print("add: realm, memory, repo, wiki, tool, github, or list", file=sys.stderr)
+            return 2
+    except ValueError as exc:
+        print(f"add: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(payload, indent=2), file=out)
+        return 0
+    kind = str(payload.get("kind") or command)
+    if kind == "list" or command == "list":
+        if payload.get("wiki"):
+            print(f"wiki:    {payload['wiki']}", file=out)
+        for repo in payload.get("repos") or ():
+            print(f"repo:    {repo['name']} {repo['path']}", file=out)
+        for realm in payload.get("realms") or ():
+            print(f"realm:   {realm['name']} #{realm['channel_id']}", file=out)
+        for channel_id in payload.get("memory") or ():
+            print(f"memory:  #{channel_id}", file=out)
+        for tool in payload.get("tools") or ():
+            print(f"tool:    {tool['name']} {tool.get('hint') or ''}", file=out)
+        if payload.get("env"):
+            print(f"env:     {payload['env']}", file=out)
+        return 0
+    if kind == "realm":
+        cwd = f" cwd={payload['cwd']}" if payload.get("cwd") else ""
+        print(f"added realm {payload['name']} #{payload['channel_id']}{cwd}", file=out)
+    elif kind == "memory":
+        print(f"added memory #{payload['channel_id']}", file=out)
+    elif kind == "repo":
+        print(f"added repo {payload['name']} {payload['path']}", file=out)
+    elif kind == "wiki":
+        print(f"added wiki {payload.get('url') or '(token only)'}", file=out)
+    elif kind == "tool":
+        print(f"added tool {payload['name']}", file=out)
+    elif kind == "github":
+        if payload.get("token"):
+            print("added github token on this host", file=out)
+        else:
+            print(
+                "added github. Pass --token or run gh auth login on this Mac.",
+                file=out,
+            )
+    if payload.get("restart"):
+        print("restart the host so the running process sees this", file=out)
     return 0
 
 
@@ -1039,10 +1186,16 @@ def cmd_note(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
 
 def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     out = out or sys.stdout
+    from agent_discord.host.repos import host_path
+
+    os.environ["PATH"] = host_path()
     config = apply_runtime_secrets(load_config())
     config.workspace.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(config.database_path)
     store.initialize()
+    stale = store.fail_stale_runs()
+    if stale:
+        print(f"cleared {stale} leftover running job(s)", flush=True)
     store.seed_owner_from_env()
     from agent_discord.orchestration.service import (
         seed_spend_cap_from_env,
@@ -1065,6 +1218,7 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         owner_id=f"{CLI_OWNER_PREFIX}{os.getpid()}-{uuid4().hex[:8]}",
         bot_token_fingerprint=config.bot_token_fingerprint or "local-dev",
     )
+    os.environ["PUPPETMASTER_STATE_DIR"] = str(config.workspace / "puppetmaster")
     orch = AgentOrchestrator(
         store=store,
         backend=backend,
@@ -1077,6 +1231,9 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         compute_cwd=config.puppetmaster_cwd,
         retry_backoff_s=15.0,
     )
+    from agent_discord.host.github import host_github_report
+
+    orch.host_github = host_github_report
     claimed = False
     exit_code = 0
     panel_stop = threading.Event()
@@ -1404,6 +1561,7 @@ def cmd_setup(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     if not args.json and invite:
         print(f"invite: {invite}", file=out)
         print("Press On in the HOST card after the bot is in the channel.", file=out)
+        print("Then: discord-os add realm <name> --channel-id ID   (or type bind <name> in Discord)", file=out)
     return code
 
 
@@ -1834,6 +1992,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_schedule(args)
     if args.command == "spend":
         return cmd_spend(args)
+    if args.command == "add":
+        return cmd_add(args)
     parser.error(f"unknown command {args.command}")
     return 2
 

@@ -11,11 +11,23 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from agent_discord.contracts import RunReceipt, TaskIntake
+from agent_discord.contracts import RunReceipt, TaskIntake, TaskStatus
 from agent_discord.orchestration.routing import MODE_IMPLEMENT, compute_dispatch_mode
 
 
 DEFAULT_MAX_LIVE = 8
+_ORIGIN_THREADS: set[str] = set()
+
+
+
+def note_origin_thread(thread_id: str) -> None:
+    tid = (thread_id or "").strip()
+    if tid:
+        _ORIGIN_THREADS.add(tid)
+
+
+def drop_origin_thread(thread_id: str) -> None:
+    _ORIGIN_THREADS.discard((thread_id or "").strip())
 
 
 class JobPool:
@@ -28,6 +40,7 @@ class JobPool:
         self._write_locks: dict[str, threading.Lock] = {}
         self._done: list[RunReceipt] = []
         self._seq = 0
+        self._live_threads: dict[str, str] = {}
 
     def submit(
         self,
@@ -50,9 +63,25 @@ class JobPool:
                     receipt = runner(intake)
                 with self._lock:
                     self._done.append(receipt)
+            except Exception as exc:
+                print(f"job {job_id} crashed: {exc}", flush=True)
+                import traceback
+
+                traceback.print_exc()
+                with self._lock:
+                    self._done.append(
+                        RunReceipt(
+                            task_id="",
+                            run_id=job_id,
+                            status=TaskStatus.FAILED,
+                            summary=str(exc),
+                            error=str(exc),
+                        )
+                    )
             finally:
                 with self._lock:
                     self._live.pop(job_id, None)
+                    self._live_threads.pop(job_id, None)
 
         thread = threading.Thread(
             target=run,
@@ -62,6 +91,9 @@ class JobPool:
         self._wait_for_slot()
         with self._lock:
             self._live[job_id] = thread
+            tid = str(intake.thread_id or "").strip()
+            if tid:
+                self._live_threads[job_id] = tid
         thread.start()
         return job_id
 
@@ -74,6 +106,15 @@ class JobPool:
     def live_count(self) -> int:
         with self._lock:
             return len(self._live)
+
+    def is_thread_live(self, thread_id: str) -> bool:
+        tid = (thread_id or "").strip()
+        if not tid:
+            return False
+        with self._lock:
+            if tid in self._live_threads.values():
+                return True
+        return tid in _ORIGIN_THREADS
 
     def wait(self, timeout: Optional[float] = None) -> list[RunReceipt]:
         deadline = None if timeout is None else time.monotonic() + float(timeout)

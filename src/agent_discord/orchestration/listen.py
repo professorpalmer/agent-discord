@@ -30,6 +30,7 @@ from agent_discord.orchestration.cards import (
 from agent_discord.orchestration.service import (
     author_may_dispatch,
     is_spend_halted,
+    operators_configured,
     parse_schedule_command,
     seed_spend_cap_from_env,
     seed_write_gate_from_env,
@@ -365,12 +366,19 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
+        follow_thread = message.thread_id or thread_id
+        if (
+            follow_thread
+            and job_pool is not None
+            and getattr(job_pool, "is_thread_live", lambda _tid: False)(follow_thread)
+        ):
+            intake_meta["steer"] = True
         intake = TaskIntake(
             text=text,
             channel_id=channel_id,
             workspace_id=workspace_id,
             guild_id=guild_id,
-            thread_id=message.thread_id or thread_id,
+            thread_id=follow_thread,
             message_id=message.message_id or None,
             requester_id=message.author_id,
             metadata=intake_meta,
@@ -628,6 +636,13 @@ def publish_host_card(
             avatar_url = ""
     from agent_discord.host.memory import channel_is_memory
 
+    github = ""
+    try:
+        from agent_discord.host.github import github_host_row
+
+        github = github_host_row()
+    except Exception:
+        github = "sign-in"
     card = host_card(
         armed=armed,
         channel_id=channel_id,
@@ -638,6 +653,7 @@ def publish_host_card(
         write_gate=write_gate,
         realm=realm or _realm_name(store, channel_id),
         bank=channel_is_memory(store, channel_id),
+        github=github,
     )
     control = None
     reader = getattr(store, "get_host_control", None)
@@ -647,7 +663,17 @@ def publish_host_card(
         except Exception:
             control = None
     card_id = str((control or {}).get("card_message_id") or "")
-    buttons = host_panel_components(armed, jobs=jobs, write_gate=write_gate)
+    paired = False
+    try:
+        paired = bool(operators_configured(store))
+    except Exception:
+        paired = False
+    buttons = host_panel_components(
+        armed,
+        jobs=jobs,
+        write_gate=write_gate,
+        paired=paired,
+    )
     if card_id:
         try:
             edit_card(discord, channel_id, card_id, card, components=buttons)

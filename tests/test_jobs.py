@@ -134,3 +134,37 @@ def test_drain_with_pool_returns_while_jobs_run(tmp_path: Path):
     receipts = pool.wait(timeout=3.0)
     assert len(receipts) == 2
     store.close()
+
+
+def test_job_pool_surfaces_a_crashed_runner():
+    pool = JobPool()
+
+    def boom(intake: TaskIntake):
+        raise RuntimeError("backend died")
+
+    pool.submit(boom, TaskIntake(text="x", channel_id="ch", workspace_id="ws"))
+    receipts = pool.wait(timeout=2.0)
+    assert len(receipts) == 1
+    assert receipts[0].status == TaskStatus.FAILED
+    assert "backend died" in (receipts[0].error or "")
+
+
+def test_fail_stale_runs(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "stale.sqlite3")
+    store.initialize()
+    store.create_task(
+        task_id="t1",
+        workspace_id="ws",
+        channel_id="ch",
+        intake_text="left hanging",
+    )
+    store.create_run(
+        run_id="r1",
+        task_id="t1",
+        model="openrouter/auto",
+        adapter_name="openrouter/auto",
+        status=TaskStatus.RUNNING,
+    )
+    assert store.fail_stale_runs() == 1
+    assert store.get_run("r1")["status"] == "failed"
+    store.close()
