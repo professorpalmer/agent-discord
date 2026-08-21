@@ -51,7 +51,9 @@ From Discord you can also type `bind puppetmaster` or `bind memory` in that chan
 | `bind memory` | This channel is think-tank |
 | a sentence | A task. Two channels cook at once. |
 
-![HOST card](docs/screenshots/discord-host.png)
+![HOST card and a finished job thread](docs/screenshots/discord-host.png)
+
+![Two asks at once, live thinking card](docs/screenshots/discord-jobs.png)
 
 ## Docs
 
