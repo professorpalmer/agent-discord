@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import queue
+import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from agent_discord.contracts import (
     DispatchEvent,
@@ -191,6 +194,150 @@ class PuppetmasterCliBackend:
     def status(self, run_id: str) -> TaskStatus:
         return self._statuses.get(run_id, TaskStatus.PENDING)
 
+    def stream(self, request: DispatchRequest) -> Iterator[DispatchEvent]:
+        """Stream dispatch progress live instead of blocking until completion."""
+        pin = self.resolve_model(request.model)
+        self._statuses[request.run_id] = TaskStatus.RUNNING
+
+        if not self.available():
+            self._statuses[request.run_id] = TaskStatus.FAILED
+            yield DispatchEvent(
+                kind=EventKind.ERROR,
+                summary=ProgressSummary(
+                    stage="dispatch",
+                    message=f"puppetmaster CLI not found: {self.cli}",
+                ),
+            )
+            return
+
+        if not pin.adapter_name:
+            self._statuses[request.run_id] = TaskStatus.FAILED
+            yield DispatchEvent(
+                kind=EventKind.ERROR,
+                summary=ProgressSummary(
+                    stage="dispatch",
+                    message="model pin adapter_name is unavailable",
+                ),
+            )
+            return
+
+        prompt = _safe_dispatch_prompt(request)
+        command = [
+            self.cli,
+            "cursor",
+            "--implement",
+            "--allow-dirty",
+            "--model",
+            pin.adapter_name,
+            "--timeout-seconds",
+            str(int(self.timeout_seconds)),
+        ]
+        workdir = str(self.cwd) if self.cwd else None
+        if workdir:
+            command.extend(["--cwd", workdir])
+        command.append(prompt)
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=workdir,
+            )
+        except OSError as exc:
+            self._statuses[request.run_id] = TaskStatus.FAILED
+            yield DispatchEvent(
+                kind=EventKind.ERROR,
+                summary=ProgressSummary(stage="dispatch", message=str(exc)),
+            )
+            return
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        stdout_queue: queue.Queue[Optional[str]] = queue.Queue()
+        stderr_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+        def _reader(pipe: Any, out: queue.Queue[Optional[str]], sink: list[str]) -> None:
+            try:
+                for line in iter(pipe.readline, ""):
+                    sink.append(line)
+                    out.put(line)
+            finally:
+                out.put(None)
+
+        threads = [
+            threading.Thread(target=_reader, args=(proc.stdout, stdout_queue, stdout_lines), daemon=True),
+            threading.Thread(target=_reader, args=(proc.stderr, stderr_queue, stderr_lines), daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        yield DispatchEvent(
+            kind=EventKind.DISPATCH,
+            summary=ProgressSummary(
+                stage="dispatch",
+                message=f"dispatched via CLI with {pin.adapter_name}",
+                percent=2.0,
+                details={"model": pin.canonical},
+            ),
+        )
+
+        done_stdout = False
+        done_stderr = False
+        try:
+            while not (done_stdout and done_stderr):
+                if not done_stdout:
+                    try:
+                        line = stdout_queue.get(timeout=0.25)
+                        if line is None:
+                            done_stdout = True
+                        else:
+                            event = _parse_progress_line(line, pin.canonical)
+                            if event is not None:
+                                yield event
+                    except queue.Empty:
+                        pass
+                if not done_stderr:
+                    try:
+                        line = stderr_queue.get(timeout=0.25)
+                        if line is None:
+                            done_stderr = True
+                    except queue.Empty:
+                        pass
+                if proc.poll() is not None and done_stdout and done_stderr:
+                    break
+            proc.wait(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            self._statuses[request.run_id] = TaskStatus.FAILED
+            yield DispatchEvent(
+                kind=EventKind.ERROR,
+                summary=ProgressSummary(stage="dispatch", message="timeout"),
+            )
+            return
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+        safe_meta = _parse_safe_cli_completion(stdout, stderr)
+        if proc.returncode != 0:
+            self._statuses[request.run_id] = TaskStatus.FAILED
+            err = safe_meta.get("error") or stderr.strip() or f"exit {proc.returncode}"
+            yield DispatchEvent(
+                kind=EventKind.ERROR,
+                summary=ProgressSummary(stage="dispatch", message=str(err)),
+            )
+            return
+
+        summary = str(safe_meta.get("summary") or "completed")
+        self._statuses[request.run_id] = TaskStatus.COMPLETED
+        yield DispatchEvent(
+            kind=EventKind.RECEIPT,
+            summary=ProgressSummary(stage="done", message=summary, percent=100.0),
+            payload=safe_meta,
+        )
+
 
 def _safe_dispatch_prompt(request: DispatchRequest) -> str:
     """Build a plain-text prompt suitable for `puppetmaster cursor` (no hidden CoT)."""
@@ -345,3 +492,69 @@ def _try_parse_json(text: str) -> Optional[Any]:
             except json.JSONDecodeError:
                 return None
         return None
+
+
+_PROGRESS_RE = re.compile(r"progress[:\s]+(\d+(?:\.\d+)?)%?", re.IGNORECASE)
+_STAGE_RE = re.compile(r"stage[:\s]+([a-zA-Z0-9_\-]+)", re.IGNORECASE)
+
+
+def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
+    """Parse a single CLI output line into a safe PROGRESS event when possible."""
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+    if lower.startswith(("job_id:", "artifacts:", "summary:")):
+        return None
+    percent: Optional[float] = None
+    stage = "working"
+    message = raw[:500]
+
+    match = _PROGRESS_RE.search(raw)
+    if match:
+        try:
+            percent = float(match.group(1))
+        except ValueError:
+            percent = None
+    stage_match = _STAGE_RE.search(raw)
+    if stage_match:
+        stage = stage_match.group(1)
+
+    parsed = _try_parse_json(raw)
+    if isinstance(parsed, dict):
+        cleaned = strip_forbidden_keys(parsed)
+        if isinstance(cleaned, dict):
+            if "percent" in cleaned:
+                try:
+                    percent = float(cleaned["percent"])
+                except (TypeError, ValueError):
+                    pass
+            if "stage" in cleaned:
+                stage = str(cleaned["stage"])
+            if "message" in cleaned:
+                message = str(cleaned["message"])[:500]
+            elif "summary" in cleaned:
+                message = str(cleaned["summary"])[:500]
+            details = {k: v for k, v in cleaned.items() if k in {"reasoning_summary", "plan", "plan_summary", "approach", "findings"}}
+            return DispatchEvent(
+                kind=EventKind.PROGRESS,
+                summary=ProgressSummary(
+                    stage=stage,
+                    message=redact_text_markers(message),
+                    percent=percent,
+                    details=details,
+                ),
+            )
+
+    if percent is None and not any(word in lower for word in ("plan", "step", "tool", "finding", "reasoning", "working", "running")):
+        return None
+
+    return DispatchEvent(
+        kind=EventKind.PROGRESS,
+        summary=ProgressSummary(
+            stage=stage,
+            message=redact_text_markers(message),
+            percent=percent,
+            details={"model": model},
+        ),
+    )

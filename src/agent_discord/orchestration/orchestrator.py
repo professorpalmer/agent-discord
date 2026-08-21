@@ -10,6 +10,7 @@ from agent_discord.contracts import (
     ArtifactRef,
     ContextSnapshot,
     DispatchRequest,
+    DispatchResult,
     EventKind,
     ProgressSummary,
     RunReceipt,
@@ -189,9 +190,15 @@ class AgentOrchestrator:
                     progress_message_id,
                     intake.text,
                 )
-        result = self.backend.dispatch(request)
+        stream = getattr(self.backend, "stream", None)
+        if callable(stream):
+            events_iter = stream(request)
+            result = None
+        else:
+            result = self.backend.dispatch(request)
+            events_iter = iter(result.events)
 
-        for event in result.events:
+        for event in events_iter:
             safe_details = strip_forbidden_keys(dict(event.summary.details))
             if not isinstance(safe_details, dict):
                 safe_details = {}
@@ -235,6 +242,30 @@ class AgentOrchestrator:
                     thread_id=job_thread_id,
                     message_id=progress_message_id,
                 )
+                if job_thread_id and summary.details:
+                    reasoning_bits = []
+                    for key in ("reasoning_summary", "plan", "plan_summary", "approach", "findings"):
+                        value = summary.details.get(key)
+                        if value:
+                            reasoning_bits.append(f"**{key.replace('_', ' ').title()}:** {value}")
+                    if reasoning_bits:
+                        try:
+                            send_card(
+                                self.discord,
+                                intake.channel_id,
+                                "\n".join(reasoning_bits),
+                                thread_id=job_thread_id,
+                            )
+                        except Exception:
+                            pass
+
+        if result is None:
+            result = DispatchResult(
+                run_id=run_id,
+                status=self._run_status.get(run_id, TaskStatus.COMPLETED),
+                events=tuple(progress_items),
+                final_summary=progress_items[-1].message if progress_items else "completed",
+            )
 
         receipt_artifacts: list[ArtifactRef] = []
         for art in result.artifacts:

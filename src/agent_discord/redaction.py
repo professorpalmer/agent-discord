@@ -16,6 +16,16 @@ FORBIDDEN_PAYLOAD_KEYS = frozenset(
         "reasoning",
     }
 )
+
+ALLOWED_REASONING_KEYS = frozenset(
+    {
+        "reasoning_summary",
+        "plan",
+        "plan_summary",
+        "approach",
+        "findings",
+    }
+)
 _HIDDEN_BLOCK_RE = re.compile(
     r"<(?:thinking|analysis|reasoning)>.*?</(?:thinking|analysis|reasoning)>",
     flags=re.IGNORECASE | re.DOTALL,
@@ -34,12 +44,18 @@ _HIDDEN_FIELD_RE = re.compile(
 
 
 def strip_forbidden_keys(value: Any) -> Any:
-    """Recursively strip forbidden keys from mappings and walk lists/tuples."""
+    """Recursively strip forbidden keys from mappings and walk lists/tuples.
+
+    Allowed reasoning summaries (``reasoning_summary``, ``plan``, etc.) are
+    preserved so Discord threads can show followable progress without leaking
+    raw chain-of-thought.
+    """
     if isinstance(value, Mapping):
         return {
             str(k): strip_forbidden_keys(v)
             for k, v in value.items()
             if str(k).lower() not in FORBIDDEN_PAYLOAD_KEYS
+            or str(k).lower() in ALLOWED_REASONING_KEYS
         }
     if isinstance(value, list):
         return [strip_forbidden_keys(item) for item in value]
