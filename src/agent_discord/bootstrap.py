@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_discord import PRODUCT_NAME
+from agent_discord import PRODUCT_NAME, __version__
 from agent_discord.config import AppConfig, load_config
 from agent_discord.persistence.sqlite import SQLiteStore
 
@@ -39,7 +39,7 @@ def bootstrap_workspace(
 
     marker = {
         "product": PRODUCT_NAME,
-        "version": "0.4.0",
+        "version": __version__,
         "workspace": str(config.workspace),
         "database": str(config.database_path),
         "discord_mcp_provider": config.discord_mcp_provider,

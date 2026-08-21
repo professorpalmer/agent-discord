@@ -4,7 +4,7 @@ Discord is the screen. This process is the computer. Your phone is the remote.
 
 This is **your** bot on **your** machine. There is no hosted fleet to invite. Leave the host running; turn work on and off from Discord.
 
-The GitHub repo is [`professorpalmer/agent-discord`](https://github.com/professorpalmer/agent-discord). The `agent-discord` command still works. Env vars and the `.agent-discord` workspace directory stay as they are.
+The GitHub repo is [`professorpalmer/discord-os`](https://github.com/professorpalmer/discord-os). The `agent-discord` command still works. Env vars and the `.agent-discord` workspace directory stay as they are.
 
 ## 1. Make a Discord bot
 
@@ -46,17 +46,28 @@ Then one command:
 discord-os setup --channel-id YOUR_CHANNEL_ID
 ```
 
-That invites the bot (open the printed URL), installs a login helper so it comes back after reboot, and posts a HOST card in the channel with **On**, **Off**, and **Ask**. You do not type commands in Discord after this.
+That invites the bot (open the printed URL), installs a login helper so it comes back after reboot, and posts a HOST card in the channel with **On**, **Off**, **Ask**, **Pair**, and **Halt**. You do not type commands in Discord after this.
+
+Optional `.env` owner pin (fail closed after the first pair):
+
+```bash
+DISCORD_OWNER_ID=your-discord-user-id
+DISCORD_OS_SPEND_CAP_USD=10
+```
 
 ## 3. Use it from Discord
 
 | In Discord | What happens |
 |---|---|
-| **On** | Starts work on the host. Type a normal sentence as a task. |
-| **Ask** | Opens a prompt. Questions stay read-only. File work still edits. |
+| **On** | Starts work on the host. The first On click becomes the owner if nobody is paired. |
+| **Ask** | Opens a prompt. Questions run now. File work waits for **Approve**. |
+| **Pair** | First click becomes owner. After that, only paired users dispatch. |
+| **Halt** | Stops new jobs when spend is too high. `discord-os spend --resume` clears it. |
 | **Off** then **Confirm** | Stops work. Cancel keeps it running. The helper stays so On still works from your phone. |
 | Recent jobs | String select on the HOST card. Pick a run to see its receipt. |
-| a normal sentence | A task, only while On. Progress starts a thread; the receipt stays in that thread. |
+| `schedule every 1h: run tests` | One SQLite cron row. The listen loop fires it. |
+| a voice memo | Transcribed with a local whisper CLI if one is on PATH. |
+| a normal sentence | A task, only while On, and only from a paired operator. |
 
 If Discord logs the bot out, work stops. The login helper starts again idle.
 

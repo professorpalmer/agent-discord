@@ -26,6 +26,7 @@ from agent_discord.orchestration.cards import (
     progress_card,
     receipt_card,
     send_card,
+    working_card,
 )
 from agent_discord.orchestration.routing import (
     MODE_IMPLEMENT,
@@ -103,6 +104,11 @@ class AgentOrchestrator:
             )
             if not claimed:
                 return self._duplicate_receipt(intake.message_id)
+
+        from agent_discord.orchestration.service import is_spend_halted
+
+        if is_spend_halted(self.store, intake.workspace_id):
+            return self._halted_receipt(intake)
 
         task_id = uuid4().hex
         run_id = uuid4().hex
@@ -233,6 +239,13 @@ class AgentOrchestrator:
                 "workers": workers,
             }
         )
+        approved = bool(extra_meta.get("approved"))
+        if compute_mode == MODE_IMPLEMENT and not approved:
+            return self._park_for_approval(
+                intake,
+                task_id=task_id,
+                run_id=run_id,
+            )
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
@@ -486,6 +499,7 @@ class AgentOrchestrator:
                 "output_tokens": result.usage.output_tokens,
                 "metadata": strip_forbidden_keys(dict(result.usage.metadata)),
             }
+            self._record_usage_spend(intake.workspace_id, run_id, result.usage)
 
         safe_final_summary = redact_text_markers(result.final_summary)
         safe_error = redact_text_markers(result.error) if result.error else None
@@ -701,8 +715,131 @@ class AgentOrchestrator:
                 }
             return {"action": verb, "run_id": run_id, "status": "missing"}
         if verb == "approve":
-            return {"action": verb, "run_id": run_id, "status": "approved"}
+            return self._approve_parked_run(run_id)
         return {"action": verb, "run_id": run_id, "status": "ignored"}
+
+    def _approve_parked_run(self, run_id: str) -> dict[str, Any]:
+        run = self.store.get_run(run_id) or {}
+        task_id = str(run.get("task_id") or "")
+        reader = getattr(self.store, "task_metadata", None)
+        meta = reader(task_id) if callable(reader) and task_id else {}
+        if not isinstance(meta, dict) or not meta.get("awaiting_approval"):
+            return {"action": "approve", "run_id": run_id, "status": "approved"}
+        task = self.store.get_task(task_id) or {}
+        intake_meta = dict(meta.get("intake_meta") or {})
+        intake_meta["approved"] = True
+        intake = TaskIntake(
+            text=str(task.get("intake_text") or meta.get("text") or ""),
+            channel_id=str(task.get("channel_id") or meta.get("channel_id") or ""),
+            workspace_id=str(task.get("workspace_id") or meta.get("workspace_id") or "default"),
+            guild_id=meta.get("guild_id"),
+            thread_id=task.get("thread_id") or meta.get("thread_id"),
+            requester_id=task.get("requester_id") or meta.get("requester_id"),
+            metadata=intake_meta,
+        )
+        merger = getattr(self.store, "merge_task_metadata", None)
+        if callable(merger):
+            merger(task_id, {"awaiting_approval": False})
+        try:
+            self.store.update_run(
+                run_id,
+                status=TaskStatus.COMPLETED,
+                summary="approved; write started",
+            )
+        except Exception:
+            pass
+        if not intake.text.strip() or not intake.channel_id:
+            return {"action": "approve", "run_id": run_id, "status": "missing"}
+        receipt = self.run_task(intake)
+        return {
+            "action": "approve",
+            "run_id": receipt.run_id,
+            "parked_run_id": run_id,
+            "status": receipt.status.value,
+            "receipt": receipt,
+        }
+
+    def _park_for_approval(
+        self,
+        intake: TaskIntake,
+        *,
+        task_id: str,
+        run_id: str,
+    ) -> RunReceipt:
+        merger = getattr(self.store, "merge_task_metadata", None)
+        if callable(merger):
+            merger(
+                task_id,
+                {
+                    "awaiting_approval": True,
+                    "text": intake.text,
+                    "channel_id": intake.channel_id,
+                    "workspace_id": intake.workspace_id,
+                    "guild_id": intake.guild_id,
+                    "thread_id": intake.thread_id,
+                    "requester_id": intake.requester_id,
+                    "intake_meta": dict(intake.metadata or {}),
+                },
+            )
+        summary = "Waiting for Approve to write."
+        try:
+            self.store.update_run(run_id, status=TaskStatus.PENDING, summary=summary)
+        except Exception:
+            pass
+        self._run_status[run_id] = TaskStatus.PENDING
+        receipt = RunReceipt(
+            task_id=task_id,
+            run_id=run_id,
+            status=TaskStatus.PENDING,
+            summary=summary,
+        )
+        if self.post_progress_to_discord and self.discord is not None:
+            try:
+                send_card(
+                    self.discord,
+                    intake.channel_id,
+                    working_card(
+                        task_label="Approve write",
+                        message=summary,
+                        run_id=run_id,
+                    ),
+                    thread_id=intake.thread_id,
+                )
+            except Exception:
+                pass
+        self._set_presence("idle", "Discord OS")
+        return receipt
+
+    def _halted_receipt(self, intake: TaskIntake) -> RunReceipt:
+        return RunReceipt(
+            task_id="",
+            run_id="",
+            status=TaskStatus.FAILED,
+            summary="spend halted",
+            error="spend halted",
+        )
+
+    def _record_usage_spend(
+        self,
+        workspace_id: str,
+        run_id: str,
+        usage: UsageReceipt,
+    ) -> None:
+        from agent_discord.orchestration.service import (
+            is_spend_halted,
+            set_spend_halted,
+            spend_usd_from_usage,
+        )
+
+        usd = spend_usd_from_usage(usage)
+        writer = getattr(self.store, "record_spend", None)
+        if callable(writer) and usd > 0:
+            try:
+                writer(workspace_id, run_id, usd)
+            except Exception:
+                return
+        if is_spend_halted(self.store, workspace_id):
+            set_spend_halted(self.store, True)
 
     def _set_presence(self, status: str, name: str) -> None:
         sender = self.presence

@@ -54,6 +54,8 @@ def render_receipt(receipt: RunReceipt, *, max_progress: int = 5) -> str:
                 lines.append(f"- `{art.kind}`")
 
     if receipt.usage:
+        from agent_discord.orchestration.service import format_usd, spend_usd_from_usage
+
         lines.append("")
         lines.append(
             f"Usage: model `{receipt.usage.model}` "
@@ -64,6 +66,8 @@ def render_receipt(receipt: RunReceipt, *, max_progress: int = 5) -> str:
                 f"Tokens: in={receipt.usage.input_tokens!s} "
                 f"out={receipt.usage.output_tokens!s}"
             )
+        cost = spend_usd_from_usage(receipt.usage)
+        lines.append(f"Cost: {format_usd(cost)}")
 
     if receipt.error:
         lines.append("")

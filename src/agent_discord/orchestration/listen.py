@@ -24,6 +24,14 @@ from agent_discord.orchestration.cards import (
     open_card,
     send_card,
 )
+from agent_discord.orchestration.service import (
+    author_may_dispatch,
+    is_spend_halted,
+    parse_schedule_command,
+    seed_spend_cap_from_env,
+    session_spend_usd,
+    spend_cap_usd,
+)
 
 DISCORD_EPOCH_MS = 1_420_070_400_000
 LISTEN_HISTORY_SLACK_MS = 15_000
@@ -142,7 +150,11 @@ def should_dispatch_inbound(message: DiscordMessage) -> bool:
         return False
     if not content:
         if isinstance(meta, dict) and (
-            meta.get("transcript") or meta.get("voice_transcript")
+            meta.get("transcript")
+            or meta.get("voice_transcript")
+            or meta.get("voice_urls")
+            or meta.get("local_audio_path")
+            or meta.get("voice_bytes")
         ):
             return True
         return False
@@ -192,6 +204,8 @@ def drain_inbound(
     receipts: list[RunReceipt] = []
     ws = Path(workspace) if workspace is not None else _workspace_from(orchestrator)
     store = getattr(orchestrator, "store", None)
+    if store is not None:
+        seed_spend_cap_from_env(store, env)
     seed_ms = since_ms if since_ms is not None else default_listen_since_ms()
     seeder = getattr(store, "seed_listen_watermark", None)
     if callable(seeder):
@@ -235,6 +249,15 @@ def drain_inbound(
             )
             continue
         if is_open_command(message.content or ""):
+            if not author_may_dispatch(
+                store,
+                message.author_id,
+                role_ids=_author_role_ids(message),
+            ):
+                watermark = _advance_listen_watermark(
+                    store, channel_id, created_ms, message.message_id, watermark
+                )
+                continue
             if not _channel_is_armed(store, channel_id):
                 _claim_inbound(store, discord, message, channel_id)
                 publish_host_card(
@@ -267,6 +290,22 @@ def drain_inbound(
                 store, channel_id, created_ms, message.message_id, watermark
             )
             continue
+        scheduled = parse_schedule_command(intake_text or (message.content or ""))
+        if scheduled is not None:
+            _absorb_schedule(
+                message,
+                discord=discord,
+                store=store,
+                channel_id=channel_id,
+                workspace_id=workspace_id,
+                every_s=scheduled[0],
+                prompt=scheduled[1],
+                thread_id=message.thread_id or thread_id,
+            )
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
         if not intake_text and not should_dispatch_inbound(message):
             watermark = _advance_listen_watermark(
                 store, channel_id, created_ms, message.message_id, watermark
@@ -279,6 +318,20 @@ def drain_inbound(
             continue
         text = intake_text or (message.content or "").strip()
         if not text:
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
+        if is_spend_halted(store, workspace_id):
+            watermark = _advance_listen_watermark(
+                store, channel_id, created_ms, message.message_id, watermark
+            )
+            continue
+        if not author_may_dispatch(
+            store,
+            message.author_id,
+            role_ids=_author_role_ids(message),
+        ):
             watermark = _advance_listen_watermark(
                 store, channel_id, created_ms, message.message_id, watermark
             )
@@ -300,6 +353,16 @@ def drain_inbound(
         watermark = _advance_listen_watermark(
             store, channel_id, created_ms, message.message_id, watermark
         )
+    receipts.extend(
+        _fire_due_schedules(
+            orchestrator,
+            store,
+            channel_id=channel_id,
+            workspace_id=workspace_id,
+            guild_id=guild_id,
+            thread_id=thread_id,
+        )
+    )
     return receipts
 
 
@@ -427,6 +490,10 @@ def _absorb_power(
     store = getattr(orchestrator, "store", None)
     _claim_inbound(store, discord, message, channel_id)
     parsed = parse_power_command(message.content or "")
+    if parsed.action == "on":
+        from agent_discord.orchestration.service import seed_owner_if_empty
+
+        seed_owner_if_empty(store, message.author_id)
     writer = getattr(store, "set_host_control", None)
     if parsed.action in {"on", "off"} and callable(writer):
         writer(channel_id, armed=parsed.action == "on")
@@ -445,6 +512,17 @@ def publish_host_card(
     from agent_discord.host.panel import host_panel_components
 
     armed = _channel_is_armed(store, channel_id)
+    spend = 0.0
+    cap = None
+    halted = False
+    try:
+        spend = session_spend_usd(store)
+        cap = spend_cap_usd(store)
+        halted = is_spend_halted(store)
+    except Exception:
+        spend = 0.0
+        cap = None
+        halted = False
     jobs: list[dict] = []
     lister = getattr(store, "list_recent_jobs", None)
     if callable(lister):
@@ -461,7 +539,14 @@ def publish_host_card(
             avatar_url = bot_avatar_url(fetch_bot_identity(token=token))
         except Exception:
             avatar_url = ""
-    card = host_card(armed=armed, channel_id=channel_id, avatar_url=avatar_url)
+    card = host_card(
+        armed=armed,
+        channel_id=channel_id,
+        avatar_url=avatar_url,
+        spend_usd=spend,
+        cap_usd=cap,
+        halted=halted,
+    )
     control = None
     reader = getattr(store, "get_host_control", None)
     if callable(reader):
@@ -501,7 +586,7 @@ def publish_host_card(
 
 
 def _collab_intake(message: DiscordMessage, discord: Any) -> tuple[str, dict[str, Any], bool]:
-    """Voice + thread-history context. Never downloads Discord CDN audio."""
+    """Voice + thread-history context. Fetches bot-visible attachment bytes only."""
 
     meta: dict[str, Any] = {}
     if isinstance(message.metadata, Mapping):
@@ -526,7 +611,11 @@ def _collab_intake(message: DiscordMessage, discord: Any) -> tuple[str, dict[str
         meta["thread_history"] = history
         meta["reading"] = f"thread {thread_id}"
     try:
-        from agent_discord.discord.voice import detect_voice_intent, spoken_command_to_intake
+        from agent_discord.discord.voice import (
+            detect_voice_intent,
+            materialize_voice_intake,
+            spoken_command_to_intake,
+        )
     except Exception:
         return "", meta, False
     try:
@@ -538,10 +627,122 @@ def _collab_intake(message: DiscordMessage, discord: Any) -> tuple[str, dict[str
     if intent.get("kind") == "voice_attachment" and not (
         meta.get("transcript") or meta.get("voice_transcript")
     ):
-        return "", meta, True
+        transcript = ""
+        try:
+            transcript = materialize_voice_intake(message, discord)
+        except Exception:
+            transcript = ""
+        if not transcript:
+            return "", meta, True
+        meta["voice_transcript"] = transcript
+        return spoken_command_to_intake(transcript) or transcript, meta, False
     transcript = str(intent.get("intake") or intent.get("transcript") or "")
     if not transcript and (meta.get("transcript") or meta.get("voice_transcript")):
         transcript = spoken_command_to_intake(
             str(meta.get("transcript") or meta.get("voice_transcript") or "")
         )
     return transcript.strip(), meta, False
+
+
+def _author_role_ids(message: DiscordMessage) -> list[str]:
+    meta = message.metadata if isinstance(message.metadata, Mapping) else {}
+    raw = meta.get("author_roles") or meta.get("role_ids") or ()
+    if isinstance(raw, str):
+        return [bit for bit in raw.replace(",", " ").split() if bit]
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw if str(item).strip()]
+    return []
+
+
+def _absorb_schedule(
+    message: DiscordMessage,
+    *,
+    discord: Any,
+    store: Any,
+    channel_id: str,
+    workspace_id: str,
+    every_s: int,
+    prompt: str,
+    thread_id: Optional[str],
+) -> None:
+    _claim_inbound(store, discord, message, channel_id)
+    if not author_may_dispatch(store, message.author_id, role_ids=_author_role_ids(message)):
+        return
+    writer = getattr(store, "add_schedule", None)
+    if not callable(writer):
+        return
+    try:
+        writer(
+            channel_id=channel_id,
+            workspace_id=workspace_id,
+            prompt=prompt,
+            every_s=every_s,
+            created_by=str(message.author_id or ""),
+        )
+    except Exception:
+        return
+    try:
+        send_card(
+            discord,
+            channel_id,
+            host_card(armed=_channel_is_armed(store, channel_id), channel_id=channel_id),
+            thread_id=thread_id,
+        )
+    except Exception:
+        pass
+
+
+def _fire_due_schedules(
+    orchestrator: Any,
+    store: Any,
+    *,
+    channel_id: str,
+    workspace_id: str,
+    guild_id: Optional[str],
+    thread_id: Optional[str],
+) -> list[RunReceipt]:
+    if store is None or is_spend_halted(store, workspace_id):
+        return []
+    if not _channel_is_armed(store, channel_id):
+        return []
+    due_reader = getattr(store, "due_schedules", None)
+    bumper = getattr(store, "bump_schedule", None)
+    if not callable(due_reader):
+        return []
+    now_ms = int(time.time() * 1000)
+    try:
+        due = list(due_reader(now_ms, channel_id))
+    except Exception:
+        return []
+    receipts: list[RunReceipt] = []
+    for row in due:
+        prompt = str(row.get("prompt") or "").strip()
+        schedule_id = str(row.get("schedule_id") or "")
+        every_s = int(row.get("every_s") or 0)
+        if not prompt or not schedule_id:
+            continue
+        created_by = str(row.get("created_by") or "")
+        if created_by and not author_may_dispatch(store, created_by):
+            continue
+        try:
+            receipts.append(
+                orchestrator.run_task(
+                    TaskIntake(
+                        text=prompt,
+                        channel_id=channel_id,
+                        workspace_id=str(row.get("workspace_id") or workspace_id),
+                        guild_id=guild_id,
+                        thread_id=thread_id,
+                        requester_id=created_by or None,
+                        metadata={"scheduled": True, "schedule_id": schedule_id},
+                    )
+                )
+            )
+        except Exception:
+            continue
+        if callable(bumper) and every_s > 0:
+            try:
+                bumper(schedule_id, now_ms + every_s * 1000)
+            except Exception:
+                pass
+    return receipts

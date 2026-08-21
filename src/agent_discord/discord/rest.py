@@ -11,6 +11,7 @@ import json
 import uuid
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from agent_discord.contracts import DiscordAttachment, DiscordMessage
@@ -18,7 +19,11 @@ from agent_discord.discord.errors import ToolInvocationError
 from agent_discord.discord.layout import FLAG_COMPONENTS_V2
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
-USER_AGENT = "discord-os (https://github.com/professorpalmer/agent-discord)"
+USER_AGENT = "discord-os (https://github.com/professorpalmer/discord-os)"
+_ATTACHMENT_HOSTS = frozenset(
+    {"cdn.discordapp.com", "media.discordapp.net", "cdn.discord.com"}
+)
+VOICE_FETCH_MAX_BYTES = 25 * 1024 * 1024
 
 
 UrlOpener = Callable[..., Any]
@@ -60,6 +65,65 @@ def fetch_bot_identity(
         "username": str(raw.get("username") or ""),
         "avatar": str(raw.get("avatar") or ""),
     }
+
+
+def fetch_message_attachment_bytes(
+    token: str,
+    *,
+    channel_id: str,
+    message_id: str,
+    attachment_id: str,
+    opener: Optional[UrlOpener] = None,
+    max_bytes: int = VOICE_FETCH_MAX_BYTES,
+) -> bytes:
+    """Re-read the message, fetch bytes, drop the signed URL. Nothing persisted."""
+
+    raw = call_discord_json(
+        token,
+        "GET",
+        f"/channels/{channel_id}/messages/{message_id}",
+        opener=opener,
+    )
+    if not isinstance(raw, dict):
+        raise ToolInvocationError("Discord message fetch was not an object")
+    url = ""
+    for att in raw.get("attachments") or ():
+        if not isinstance(att, dict):
+            continue
+        if str(att.get("id") or "") != str(attachment_id):
+            continue
+        url = str(att.get("url") or att.get("proxy_url") or "").strip()
+        break
+    if not url:
+        raise ToolInvocationError("voice attachment URL missing from message")
+    return fetch_attachment_bytes(token, url, opener=opener, max_bytes=max_bytes)
+
+
+def fetch_attachment_bytes(
+    token: str,
+    url: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+    max_bytes: int = VOICE_FETCH_MAX_BYTES,
+) -> bytes:
+    """GET a Discord attachment URL with the bot token. Never persist the URL."""
+
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"https", "http"} or host not in _ATTACHMENT_HOSTS:
+        raise ToolInvocationError("attachment URL is not a Discord CDN host")
+    if "/attachments/" not in parsed.path:
+        raise ToolInvocationError("attachment URL is not a Discord attachment")
+    raw = _discord_request_bytes(
+        token,
+        "GET",
+        url,
+        opener=opener,
+        absolute=True,
+    )
+    if len(raw) > int(max_bytes):
+        raise ToolInvocationError("attachment exceeds fetch budget")
+    return raw
 
 
 def bot_avatar_url(identity: Mapping[str, Any]) -> str:

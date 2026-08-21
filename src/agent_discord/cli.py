@@ -335,6 +335,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_ix.add_argument("--serve", action="store_true", help="Serve loopback /interactions")
     p_ix.add_argument("--json", action="store_true")
 
+    p_pair = sub.add_parser("pair", help="Allowlist a Discord user as owner or operator")
+    p_pair.add_argument("--user-id", required=True, help="Discord user snowflake")
+    p_pair.add_argument(
+        "--role",
+        default="owner",
+        choices=("owner", "operator"),
+        help="owner is first-pair; operator can dispatch",
+    )
+    p_pair.add_argument("--role-id", default=None, help="Optional guild role snowflake")
+
+    p_sched = sub.add_parser("schedule", help="Fire a text job on an interval from this host")
+    p_sched.add_argument("--every", required=True, help="Interval such as 1h, 30m, or 3600s")
+    p_sched.add_argument("--channel-id", required=True)
+    p_sched.add_argument("--workspace-id", default="default")
+    p_sched.add_argument("prompt", nargs="+", help="Job text to dispatch when due")
+
+    p_spend = sub.add_parser("spend", help="Show session spend, set a cap, or halt new jobs")
+    p_spend.add_argument("--cap", type=float, default=None, help="USD halt threshold")
+    p_spend.add_argument("--halt", action="store_true")
+    p_spend.add_argument("--resume", action="store_true")
+    p_spend.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -431,6 +453,97 @@ def cmd_check(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                 f"content={'yes' if has_text else 'empty-or-intent-off'}",
                 file=out,
             )
+    return 0
+
+
+def cmd_pair(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    config = apply_runtime_secrets(load_config())
+    store = SQLiteStore(config.database_path)
+    store.initialize()
+    try:
+        store.add_operator(args.user_id, role=args.role)
+        if getattr(args, "role_id", None):
+            store.add_operator_role(args.role_id)
+        print(f"paired {args.user_id} as {args.role}", file=out)
+        if getattr(args, "role_id", None):
+            print(f"role {args.role_id} may also dispatch", file=out)
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_schedule(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.orchestration.service import parse_every_seconds
+
+    try:
+        every_s = parse_every_seconds(args.every)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        print("schedule prompt is required", file=sys.stderr)
+        return 2
+    config = apply_runtime_secrets(load_config())
+    store = SQLiteStore(config.database_path)
+    store.initialize()
+    try:
+        schedule_id = store.add_schedule(
+            channel_id=args.channel_id,
+            workspace_id=args.workspace_id,
+            prompt=prompt,
+            every_s=every_s,
+        )
+        print(f"scheduled {schedule_id} every {every_s}s", file=out)
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_spend(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
+    out = out or sys.stdout
+    from agent_discord.orchestration.service import (
+        format_usd,
+        is_spend_halted,
+        seed_spend_cap_from_env,
+        session_spend_usd,
+        set_spend_cap_usd,
+        set_spend_halted,
+        spend_cap_usd,
+    )
+
+    config = apply_runtime_secrets(load_config())
+    store = SQLiteStore(config.database_path)
+    store.initialize()
+    try:
+        seed_spend_cap_from_env(store)
+        if args.cap is not None:
+            set_spend_cap_usd(store, args.cap)
+        if args.halt:
+            set_spend_halted(store, True)
+        if args.resume:
+            set_spend_halted(store, False)
+        spent = session_spend_usd(store)
+        cap = spend_cap_usd(store)
+        halted = is_spend_halted(store)
+        payload = {
+            "spend_usd": spent,
+            "cap_usd": cap,
+            "halted": halted,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2), file=out)
+        else:
+            cap_s = format_usd(cap) if cap is not None else "none"
+            print(
+                f"spend {format_usd(spent)} / cap {cap_s}"
+                f"{' halted' if halted else ''}",
+                file=out,
+            )
+    finally:
+        store.close()
     return 0
 
 
@@ -787,6 +900,10 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     config.workspace.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(config.database_path)
     store.initialize()
+    store.seed_owner_from_env()
+    from agent_discord.orchestration.service import seed_spend_cap_from_env
+
+    seed_spend_cap_from_env(store)
     resolution = resolve_compute(config)
     if args.fake:
         provider = FakeDiscordMCPProvider(persist_dir=config.workspace / "fake_discord")
@@ -850,6 +967,7 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                     stop=panel_stop,
                     discord_down=discord_down,
                     asks=asks,
+                    orch=orch,
                 )
         while True:
             if discord_down.is_set():
@@ -879,6 +997,10 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                 except Empty:
                     break
                 if not store.host_is_armed(args.channel_id):
+                    continue
+                from agent_discord.orchestration.service import is_spend_halted
+
+                if is_spend_halted(store, args.workspace_id):
                     continue
                 receipts.append(
                     orch.run_task(
@@ -943,6 +1065,7 @@ def _start_panel_gateway(
     stop: threading.Event,
     discord_down: threading.Event,
     asks: Optional[Queue[str]] = None,
+    orch: Any = None,
 ) -> None:
     presence: list[Any] = []
 
@@ -978,11 +1101,18 @@ def _start_panel_gateway(
             custom_id = str(data.get("custom_id") or "")
         print(f"panel click {custom_id}", flush=True)
         def on_job(action: str, run_id: str) -> None:
+            if orch is not None:
+                try:
+                    result = orch.apply_job_action(action, run_id)
+                except Exception:
+                    result = {}
+                if action == "retry" and asks is not None:
+                    text = str((result or {}).get("intake_text") or "")
+                    if text:
+                        asks.put(text)
+                return
             if action == "retry" and asks is not None:
                 asks.put(f"retry run {run_id}")
-                return
-            if action == "approve" and asks is not None:
-                asks.put(f"implement the approved plan for {run_id}")
                 return
             if action != "cancel":
                 return
@@ -1099,6 +1229,7 @@ def cmd_host_start(args: argparse.Namespace, *, out: TextIO | None = None) -> in
     (config.workspace / "logs").mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(config.database_path)
     store.initialize()
+    store.seed_owner_from_env()
     try:
         from agent_discord.discord.rest import fetch_bot_identity
         from agent_discord.host.brand import apply_bot_avatar
@@ -1491,6 +1622,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_open(args)
     if args.command == "interactions":
         return cmd_interactions(args)
+    if args.command == "pair":
+        return cmd_pair(args)
+    if args.command == "schedule":
+        return cmd_schedule(args)
+    if args.command == "spend":
+        return cmd_spend(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
