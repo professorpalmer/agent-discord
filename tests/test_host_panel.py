@@ -73,9 +73,11 @@ def test_websocket_frame_roundtrip():
 def test_panel_buttons_and_interaction_parse():
     buttons = host_panel_components(False)
     ids = [item["custom_id"] for item in buttons[0]["components"]]
-    assert ids == [ON_ID, OFF_ID, PAIR_ID, HALT_ID]
+    assert ids == [ON_ID, OFF_ID]
+    assert [item["custom_id"] for item in buttons[1]["components"]] == [PAIR_ID, HALT_ID]
     armed = host_panel_components(True)
     assert ASK_ID in [item["custom_id"] for item in armed[0]["components"]]
+    assert [item["custom_id"] for item in armed[1]["components"]] == [PAIR_ID, HALT_ID]
     assert panel_action_from_interaction(
         {"type": 3, "data": {"custom_id": ON_ID}}
     ) == "on"
@@ -90,7 +92,7 @@ def test_panel_buttons_and_interaction_parse():
         True,
         jobs=[{"run_id": "run-1", "intake_text": "what is Discord OS?", "status": "completed"}],
     )
-    assert jobs[1]["components"][0]["custom_id"] == JOBS_ID
+    assert jobs[2]["components"][0]["custom_id"] == JOBS_ID
     assert panel_action_from_interaction(
         {"type": 3, "data": {"custom_id": JOBS_ID, "values": ["run-1"]}}
     ) == "job"
@@ -120,10 +122,12 @@ def test_handle_gateway_interaction_acks_and_arms(tmp_path: Path):
     )
     assert action == "on"
     assert store.host_is_armed("ch") is True
+    assert captured["body"]["type"] == 7
     assert store.get_host_control("ch")["card_message_id"] == "panel-1"
     assert "ix-1/ix-token/callback" in str(captured["url"])
     body = captured["body"]
-    assert body["type"] == 6
+    assert body["type"] == 7
+    assert body["data"]["components"]
     store.close()
 
 

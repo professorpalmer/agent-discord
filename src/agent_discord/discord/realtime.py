@@ -149,8 +149,8 @@ def run_discord_gateway(
                             pass
                 try:
                     on_dispatch(event, payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"panel dispatch failed: {exc}", flush=True)
     except WebSocketError as exc:
         raise GatewayClosed(str(exc), fatal=False) from exc
     finally:

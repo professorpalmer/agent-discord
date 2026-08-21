@@ -56,38 +56,36 @@ def host_panel_components(
             }
         ]
     else:
+        power = [
+            {
+                "type": BUTTON,
+                "style": STYLE_SUCCESS,
+                "custom_id": ON_ID,
+                "label": "On",
+                "disabled": bool(armed),
+            },
+            {
+                "type": BUTTON,
+                "style": STYLE_DANGER,
+                "custom_id": OFF_ID,
+                "label": "Off",
+                "disabled": not bool(armed),
+            },
+        ]
+        if armed:
+            power.append(
+                {
+                    "type": BUTTON,
+                    "style": STYLE_PRIMARY,
+                    "custom_id": ASK_ID,
+                    "label": "Ask",
+                }
+            )
         rows = [
+            {"type": COMPONENT_ROW, "components": power},
             {
                 "type": COMPONENT_ROW,
                 "components": [
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_SUCCESS,
-                        "custom_id": ON_ID,
-                        "label": "On",
-                        "disabled": bool(armed),
-                    },
-                    {
-                        "type": BUTTON,
-                        "style": STYLE_DANGER,
-                        "custom_id": OFF_ID,
-                        "label": "Off",
-                        "disabled": not bool(armed),
-                    },
-                ]
-                + (
-                    [
-                        {
-                            "type": BUTTON,
-                            "style": STYLE_PRIMARY,
-                            "custom_id": ASK_ID,
-                            "label": "Ask",
-                        }
-                    ]
-                    if armed
-                    else []
-                )
-                + [
                     {
                         "type": BUTTON,
                         "style": STYLE_PRIMARY,
@@ -101,7 +99,7 @@ def host_panel_components(
                         "label": "Halt",
                     },
                 ],
-            }
+            },
         ]
     options = _job_select_options(jobs or ())
     if options:
@@ -287,8 +285,16 @@ def interaction_callback_payload(
     *,
     channel_id: str = "",
     confirm_off: bool = False,
+    store: Any = None,
+    jobs: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    panel = host_panel_payload(armed, channel_id=channel_id, confirm_off=confirm_off)
+    panel = host_panel_payload(
+        armed,
+        channel_id=channel_id,
+        confirm_off=confirm_off,
+        jobs=jobs if jobs is not None else (_panel_jobs(store, channel_id) if store is not None else []),
+        store=store,
+    )
     return {
         "type": CALLBACK_UPDATE_MESSAGE,
         "data": {
@@ -296,6 +302,30 @@ def interaction_callback_payload(
             "components": panel["components"],
         },
     }
+
+
+def _ack_interaction(
+    payload: Mapping[str, Any],
+    callback_payload: Mapping[str, Any],
+    *,
+    opener: Any = None,
+) -> bool:
+    interaction_id, ix_token = interaction_ids(payload)
+    if not interaction_id or not ix_token:
+        return False
+    try:
+        from agent_discord.discord.rest import callback_interaction
+
+        callback_interaction(
+            interaction_id=interaction_id,
+            interaction_token=ix_token,
+            payload=dict(callback_payload),
+            opener=opener,
+        )
+        return True
+    except Exception as exc:
+        print(f"panel callback failed: {exc}", flush=True)
+        return False
 
 
 def interaction_ids(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -400,163 +430,86 @@ def handle_gateway_interaction(
 
     user_id = interaction_user_id(payload)
     role_ids = interaction_role_ids(payload)
-    if action == "pair":
-        seed_owner_if_empty(store, user_id)
-    if action == "on":
-        seed_owner_if_empty(store, user_id)
+    if action in {"pair", "on"}:
+        seeded = seed_owner_if_empty(store, user_id)
+        print(
+            f"panel {action} user={user_id or '-'} seeded={int(bool(seeded))}",
+            flush=True,
+        )
     if not author_may_operate(store, user_id, action, role_ids=role_ids):
-        interaction_id, ix_token = interaction_ids(payload)
-        if interaction_id and ix_token:
-            try:
-                from agent_discord.discord.rest import callback_interaction
-
-                callback_interaction(
-                    interaction_id=interaction_id,
-                    interaction_token=ix_token,
-                    payload={"type": CALLBACK_DEFERRED_UPDATE},
-                    opener=opener,
-                )
-            except Exception:
-                pass
+        _ack_interaction(
+            payload,
+            interaction_callback_payload(
+                _channel_armed(store, channel_id),
+                channel_id=channel_id,
+                store=store,
+            ),
+            opener=opener,
+        )
         return "denied"
-    interaction_id, ix_token = interaction_ids(payload)
-    if action == "halt":
-        if interaction_id and ix_token:
-            try:
-                from agent_discord.discord.rest import callback_interaction
-
-                callback_interaction(
-                    interaction_id=interaction_id,
-                    interaction_token=ix_token,
-                    payload={"type": CALLBACK_DEFERRED_UPDATE},
-                    opener=opener,
-                )
-            except Exception:
-                pass
-        toggle_spend_halted(store)
-        message_id = _remember_panel_message(store, channel_id, payload)
-        armed = True
-        reader = getattr(store, "host_is_armed", None)
-        if callable(reader):
-            try:
-                armed = bool(reader(channel_id, default=True))
-            except Exception:
-                armed = True
-        _paint_host_panel(
-            store,
-            channel_id,
-            token=token,
-            message_id=message_id,
-            armed=armed,
-            confirm_off=False,
-            opener=opener,
-        )
-        return action
-    if action == "pair":
-        if interaction_id and ix_token:
-            try:
-                from agent_discord.discord.rest import callback_interaction
-
-                callback_interaction(
-                    interaction_id=interaction_id,
-                    interaction_token=ix_token,
-                    payload={"type": CALLBACK_DEFERRED_UPDATE},
-                    opener=opener,
-                )
-            except Exception:
-                pass
-        message_id = _remember_panel_message(store, channel_id, payload)
-        armed = True
-        reader = getattr(store, "host_is_armed", None)
-        if callable(reader):
-            try:
-                armed = bool(reader(channel_id, default=True))
-            except Exception:
-                armed = True
-        _paint_host_panel(
-            store,
-            channel_id,
-            token=token,
-            message_id=message_id,
-            armed=armed,
-            confirm_off=False,
-            opener=opener,
-        )
-        return action
     if action == "ask":
-        if interaction_id and ix_token:
-            try:
-                from agent_discord.discord.rest import callback_interaction
-
-                callback_interaction(
-                    interaction_id=interaction_id,
-                    interaction_token=ix_token,
-                    payload=ask_modal_payload(),
-                    opener=opener,
-                )
-            except Exception:
-                pass
+        _ack_interaction(payload, ask_modal_payload(), opener=opener)
         return action
-    if interaction_id and ix_token:
-        try:
-            from agent_discord.discord.rest import callback_interaction
-
-            callback_interaction(
-                interaction_id=interaction_id,
-                interaction_token=ix_token,
-                payload={"type": CALLBACK_DEFERRED_UPDATE},
-                opener=opener,
-            )
-        except Exception:
-            pass
-    try:
-        if action == "job":
-            _publish_job_card(store, channel_id, payload, token=token, opener=opener)
-            return action
-        if action == "off":
-            message_id = _remember_panel_message(store, channel_id, payload)
-            _paint_host_panel(
-                store,
-                channel_id,
-                token=token,
-                message_id=message_id,
-                armed=True,
-                confirm_off=True,
-                opener=opener,
-            )
-            return action
-        if action == "off-cancel":
-            message_id = _remember_panel_message(store, channel_id, payload)
-            _paint_host_panel(
-                store,
-                channel_id,
-                token=token,
-                message_id=message_id,
-                armed=True,
-                confirm_off=False,
-                opener=opener,
-            )
-            return action
-        apply_panel_action(store, channel_id, action)
-        armed = action == "on"
-        if callable(on_power) and action in {"on", "off-confirm"}:
-            try:
-                on_power(armed)
-            except Exception:
-                pass
-        message_id = _remember_panel_message(store, channel_id, payload)
-        _paint_host_panel(
-            store,
-            channel_id,
-            token=token,
-            message_id=message_id,
-            armed=armed,
-            confirm_off=False,
+    if action == "halt":
+        toggle_spend_halted(store)
+    if action == "job":
+        _ack_interaction(
+            payload,
+            {"type": CALLBACK_DEFERRED_UPDATE},
             opener=opener,
         )
-    except Exception:
+        try:
+            _publish_job_card(store, channel_id, payload, token=token, opener=opener)
+        except Exception as exc:
+            print(f"panel job card failed: {exc}", flush=True)
         return action
+
+    confirm_off = action == "off"
+    if action in {"on", "off-confirm"}:
+        apply_panel_action(store, channel_id, action)
+        if callable(on_power):
+            try:
+                on_power(action == "on")
+            except Exception:
+                pass
+    armed = _channel_armed(store, channel_id)
+    if confirm_off:
+        armed = True
+    _remember_panel_message(store, channel_id, payload)
+    acked = _ack_interaction(
+        payload,
+        interaction_callback_payload(
+            armed,
+            channel_id=channel_id,
+            confirm_off=confirm_off,
+            store=store,
+        ),
+        opener=opener,
+    )
+    if not acked:
+        try:
+            _paint_host_panel(
+                store,
+                channel_id,
+                token=token,
+                message_id=_remember_panel_message(store, channel_id, payload),
+                armed=armed,
+                confirm_off=confirm_off,
+                opener=opener,
+            )
+        except Exception as exc:
+            print(f"panel paint failed: {exc}", flush=True)
     return action
+
+
+def _channel_armed(store: Any, channel_id: str) -> bool:
+    reader = getattr(store, "host_is_armed", None)
+    if not callable(reader):
+        return True
+    try:
+        return bool(reader(channel_id, default=True))
+    except Exception:
+        return True
 
 
 def _remember_panel_message(store: Any, channel_id: str, payload: Mapping[str, Any]) -> str:
