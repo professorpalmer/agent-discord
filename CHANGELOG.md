@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.7
+
+README shots are the live HOST card plus a job thread, and two asks cooking.
+
 ## 0.5.6
 
 PyPI listing leads with `pip install discord-os`. Doc links on the package page go to GitHub, not pypi.org paths.

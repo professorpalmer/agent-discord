@@ -22,6 +22,10 @@ The `agent-discord` command still works. Full setup, Discord verbs, and docs liv
 - [AGENTS.md](https://github.com/professorpalmer/discord-os/blob/master/AGENTS.md)
 - [Changelog](https://github.com/professorpalmer/discord-os/blob/master/CHANGELOG.md)
 
+![HOST card and a finished job thread](https://raw.githubusercontent.com/professorpalmer/discord-os/master/docs/screenshots/discord-host.png)
+
+![Two asks at once, live thinking card](https://raw.githubusercontent.com/professorpalmer/discord-os/master/docs/screenshots/discord-jobs.png)
+
 ## First run
 
 Once, in a browser: [Discord Developer Portal](https://discord.com/developers/applications) → New Application → **Bot** → Reset Token (`DISCORD_BOT_TOKEN`) → enable **Message Content Intent** → General Information → Application ID (`DISCORD_APPLICATION_ID`). Copy a private channel ID.
