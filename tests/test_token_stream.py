@@ -35,6 +35,13 @@ def test_parse_token_and_reasoning_lines_redact_cot():
     assert delta is not None
     assert delta.summary.details["token"] is True
 
+    durable = _parse_token_line(
+        '{"ts": 1, "kind": "text", "text": "live tokens"}',
+        "openrouter/auto",
+    )
+    assert durable is not None
+    assert "live tokens" in str(durable.summary.details["token_text"])
+
     progress = _parse_progress_line("progress: 40% stage: work running tools", "cursor/grok-4-5")
     assert progress is not None
     assert progress.summary.percent == 40.0

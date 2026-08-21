@@ -241,11 +241,14 @@ class AgentOrchestrator:
         )
         approved = bool(extra_meta.get("approved"))
         if compute_mode == MODE_IMPLEMENT and not approved:
-            return self._park_for_approval(
-                intake,
-                task_id=task_id,
-                run_id=run_id,
-            )
+            from agent_discord.orchestration.service import writes_need_approval
+
+            if writes_need_approval(self.store):
+                return self._park_for_approval(
+                    intake,
+                    task_id=task_id,
+                    run_id=run_id,
+                )
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
@@ -379,7 +382,7 @@ class AgentOrchestrator:
             if (
                 self.post_progress_to_discord
                 and self.discord is not None
-                and event.kind == EventKind.PROGRESS
+                and event.kind in {EventKind.PROGRESS, EventKind.DISPATCH}
             ):
                 if summary.percent is not None:
                     last_percent = summary.percent
@@ -501,7 +504,15 @@ class AgentOrchestrator:
             }
             self._record_usage_spend(intake.workspace_id, run_id, result.usage)
 
-        safe_final_summary = redact_text_markers(result.final_summary)
+        from agent_discord.puppetmaster.backend import (
+            _is_placeholder_summary,
+            usable_worker_text,
+        )
+
+        spoken = usable_worker_text(redact_text_markers(result.final_summary))
+        if not spoken or _is_placeholder_summary(spoken):
+            spoken = usable_worker_text(token_text) or spoken
+        safe_final_summary = spoken or "Worker finished without a written answer."
         safe_error = redact_text_markers(result.error) if result.error else None
         self.store.update_run(
             run_id,
@@ -542,6 +553,7 @@ class AgentOrchestrator:
         )
 
         if self.post_progress_to_discord and self.discord is not None:
+            painted_parent = False
             if progress_message_id:
                 try:
                     edit_card(
@@ -550,6 +562,7 @@ class AgentOrchestrator:
                         progress_message_id,
                         card,
                     )
+                    painted_parent = True
                 except Exception:
                     send_card(
                         self.discord,
@@ -564,6 +577,16 @@ class AgentOrchestrator:
                     card,
                     thread_id=job_thread_id,
                 )
+            if job_thread_id and (painted_parent or token_text.strip()):
+                try:
+                    send_card(
+                        self.discord,
+                        intake.channel_id,
+                        card,
+                        thread_id=job_thread_id,
+                    )
+                except Exception:
+                    pass
         self._set_presence("idle", "Discord OS")
 
         return receipt
@@ -802,6 +825,7 @@ class AgentOrchestrator:
                         task_label="Approve write",
                         message=summary,
                         run_id=run_id,
+                        actions="parked",
                     ),
                     thread_id=intake.thread_id,
                 )

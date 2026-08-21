@@ -15,11 +15,20 @@ from agent_discord.host.actions import (
     HostActionError,
     allow_browser_url,
     confine_host_path,
+    host_browser_argv,
     job_action_from_custom_id,
     job_custom_id,
     run_host_action,
 )
-from agent_discord.host.panel import ASK_ID, JOBS_ID, OFF_ID, ON_ID, panel_action_from_custom_id
+from agent_discord.host.panel import (
+    ASK_ID,
+    BROWSER_ID,
+    JOBS_ID,
+    OFF_ID,
+    ON_ID,
+    handle_gateway_interaction,
+    panel_action_from_custom_id,
+)
 from agent_discord.host.verbs import handle_open_message, is_open_command, parse_open_command
 from agent_discord.orchestration.cards import CARD_PREFIX
 from agent_discord.orchestration.listen import drain_inbound, should_dispatch_inbound
@@ -50,7 +59,18 @@ def test_job_custom_ids_parse_without_host_power():
     assert panel_action_from_custom_id(cancel) is None
     assert panel_action_from_custom_id(retry) is None
     for custom_id in (approve, cancel, retry):
-        assert custom_id not in {ON_ID, OFF_ID, ASK_ID, JOBS_ID, "discord-os:pair", "discord-os:halt"}
+        assert custom_id not in {
+            ON_ID,
+            OFF_ID,
+            ASK_ID,
+            JOBS_ID,
+            "discord-os:pair",
+            "discord-os:halt",
+            "discord-os:roles",
+            "discord-os:files",
+            "discord-os:terminal",
+            "discord-os:browser",
+        }
 
 
 def test_confine_host_path_stays_inside_roots(tmp_path: Path):
@@ -110,6 +130,21 @@ def test_run_host_action_uses_injected_runner(tmp_path: Path):
         run_host_action("camera", ".", roots=[tmp_path], runner=runner)
 
 
+def test_browser_button_launches_local_browser(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DISCORD_OS_BROWSER", "/opt/harness-chromium")
+    calls: list[list[str]] = []
+
+    def runner(argv, *, cwd=None):
+        calls.append(list(argv))
+
+    launched = run_host_action("browser", "", roots=[tmp_path], runner=runner)
+    assert launched.opened
+    assert launched.target == "harness chromium"
+    assert calls == [["/opt/harness-chromium"]]
+    argv = host_browser_argv("http://127.0.0.1:9/health")
+    assert argv == ["/opt/harness-chromium", "http://127.0.0.1:9/health"]
+
+
 def test_parse_open_command_surfaces():
     assert is_open_command("/open terminal")
     assert is_open_command("!open files src")
@@ -117,6 +152,7 @@ def test_parse_open_command_surfaces():
     assert parsed.surface == "terminal"
     assert parsed.target == "src"
     assert parse_open_command("/open https://discord.com/channels/1/2/3").surface == "browser"
+    assert parse_open_command("/open browser").target == ""
     assert parse_open_command("/open").surface == "files"
 
 
@@ -207,3 +243,52 @@ def test_handle_open_message_rejects_escape(tmp_path: Path):
     assert result.opened is False
     assert "outside" in result.error
     assert result.card.startswith("Could not open")
+
+
+def test_browser_button_acks_update_not_url_modal(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DISCORD_OS_BROWSER", "/opt/harness-chromium")
+    store = SQLiteStore(tmp_path / "browser.sqlite3")
+    store.initialize()
+    store.set_host_control("ch", armed=True)
+    opened: list[list[str]] = []
+    captured: list[dict] = []
+
+    def runner(argv, *, cwd=None):
+        opened.append(list(argv))
+
+    class _Resp:
+        def read(self) -> bytes:
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    def opener(request, timeout=10):
+        captured.append(
+            json.loads(request.data.decode("utf-8")) if request.data else {}
+        )
+        return _Resp()
+
+    result = handle_gateway_interaction(
+        store,
+        "ch",
+        {
+            "type": 3,
+            "id": "ix",
+            "token": "tok",
+            "application_id": "app-1",
+            "user": {"id": "owner-1"},
+            "data": {"custom_id": BROWSER_ID},
+            "message": {"id": "panel-1"},
+        },
+        opener=opener,
+        host_roots=[tmp_path],
+        host_runner=runner,
+    )
+    assert result == "browser"
+    assert captured[0]["type"] == 6
+    assert opened == [["/opt/harness-chromium"]]
+    store.close()

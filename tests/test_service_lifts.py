@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from agent_discord.cli import main
@@ -10,7 +11,7 @@ from agent_discord.discord.facade import DiscordFacade
 from agent_discord.discord.providers.fake import FakeDiscordMCPProvider
 from agent_discord.discord.rest import fetch_attachment_bytes
 from agent_discord.discord.voice import materialize_voice_intake
-from agent_discord.host.panel import HALT_ID, PAIR_ID, handle_gateway_interaction
+from agent_discord.host.panel import GATE_ID, HALT_ID, PAIR_ID, handle_gateway_interaction
 from agent_discord.orchestration.listen import drain_inbound
 from agent_discord.orchestration.orchestrator import AgentOrchestrator
 from agent_discord.orchestration.receipts import render_receipt
@@ -18,6 +19,7 @@ from agent_discord.orchestration.service import (
     format_usd,
     parse_every_seconds,
     parse_schedule_command,
+    set_write_gate,
     spend_usd_from_usage,
 )
 from agent_discord.persistence.sqlite import SQLiteStore
@@ -75,8 +77,19 @@ def test_first_armed_author_becomes_owner(tmp_path: Path):
     store.close()
 
 
+def test_implement_runs_without_approve_by_default(tmp_path: Path):
+    orch, store, _fake, backend = _orch(tmp_path)
+    receipt = orch.run_task(
+        TaskIntake(text="implement the login timeout fix", channel_id="ch", workspace_id="ws")
+    )
+    assert receipt.status == TaskStatus.COMPLETED
+    assert backend.dispatch_count == 1
+    store.close()
+
+
 def test_implement_waits_for_approve(tmp_path: Path):
     orch, store, _fake, backend = _orch(tmp_path)
+    set_write_gate(store, True)
     parked = orch.run_task(
         TaskIntake(text="implement the login timeout fix", channel_id="ch", workspace_id="ws")
     )
@@ -256,8 +269,31 @@ def test_pair_and_spend_cli(tmp_path: Path, monkeypatch, capsys):
 
 
 def test_pair_and_halt_buttons_parse(tmp_path: Path):
+    import json
+
     store = SQLiteStore(tmp_path / "panel.sqlite3")
     store.initialize()
+    captured: list[dict] = []
+
+    class _Resp:
+        def read(self) -> bytes:
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    def opener(request, timeout=10):
+        captured.append(
+            {
+                "url": request.full_url,
+                "body": json.loads(request.data.decode("utf-8")) if request.data else {},
+            }
+        )
+        return _Resp()
+
     result = handle_gateway_interaction(
         store,
         "ch",
@@ -265,12 +301,20 @@ def test_pair_and_halt_buttons_parse(tmp_path: Path):
             "type": 3,
             "id": "ix",
             "token": "tok",
+            "application_id": "app-1",
             "user": {"id": "owner-7"},
             "data": {"custom_id": PAIR_ID},
+            "message": {"id": "panel-1"},
         },
+        opener=opener,
     )
     assert result == "pair"
     assert store.is_operator("owner-7")
+    assert captured[0]["body"]["type"] == 6
+    paint = captured[1]["body"]
+    blob = json.dumps(paint)
+    assert "Paired" in blob
+    assert "webhooks/app-1/tok/messages/@original" in captured[1]["url"]
     halt = handle_gateway_interaction(
         store,
         "ch",
@@ -278,12 +322,31 @@ def test_pair_and_halt_buttons_parse(tmp_path: Path):
             "type": 3,
             "id": "ix2",
             "token": "tok",
+            "application_id": "app-1",
             "user": {"id": "owner-7"},
             "data": {"custom_id": HALT_ID},
+            "message": {"id": "panel-1"},
         },
+        opener=opener,
     )
     assert halt == "halt"
     assert store.get_preference("_host", "spend_halt") == "1"
+    gate = handle_gateway_interaction(
+        store,
+        "ch",
+        {
+            "type": 3,
+            "id": "ix3",
+            "token": "tok",
+            "application_id": "app-1",
+            "user": {"id": "owner-7"},
+            "data": {"custom_id": GATE_ID},
+            "message": {"id": "panel-1"},
+        },
+        opener=opener,
+    )
+    assert gate == "gate"
+    assert store.get_preference("_host", "write_gate") == "1"
     store.close()
 
 

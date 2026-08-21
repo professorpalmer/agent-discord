@@ -11,6 +11,7 @@ from agent_discord.contracts import UsageReceipt
 HOST_PREFS_WORKSPACE = "_host"
 SPEND_HALT_KEY = "spend_halt"
 SPEND_CAP_KEY = "spend_cap_usd"
+WRITE_GATE_KEY = "write_gate"
 DEFAULT_SPEND_CAP_USD = 10.0
 _INPUT_USD_PER_MTOK = 0.50
 _OUTPUT_USD_PER_MTOK = 1.50
@@ -97,6 +98,30 @@ def toggle_spend_halted(store: Any) -> bool:
     next_halted = not _truthy(_host_pref(store, SPEND_HALT_KEY))
     set_spend_halted(store, next_halted)
     return next_halted
+
+
+def writes_need_approval(store: Any) -> bool:
+    return _truthy(_host_pref(store, WRITE_GATE_KEY))
+
+
+def set_write_gate(store: Any, gated: bool) -> None:
+    writer = getattr(store, "set_preference", None)
+    if not callable(writer):
+        return
+    writer(HOST_PREFS_WORKSPACE, WRITE_GATE_KEY, "1" if gated else "0")
+
+
+def toggle_write_gate(store: Any) -> bool:
+    next_gated = not writes_need_approval(store)
+    set_write_gate(store, next_gated)
+    return next_gated
+
+
+def seed_write_gate_from_env(store: Any, env: Optional[Mapping[str, str]] = None) -> None:
+    raw = str((env or os.environ).get("DISCORD_OS_WRITE_GATE") or "").strip()
+    if not raw:
+        return
+    set_write_gate(store, _truthy(raw))
 
 
 def set_spend_cap_usd(store: Any, cap: float) -> None:

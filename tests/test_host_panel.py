@@ -15,11 +15,17 @@ from agent_discord.host.panel import (
     ASK_MODAL_ID,
     CANCEL_OFF_ID,
     CONFIRM_OFF_ID,
+    BROWSER_ID,
+    FILES_ID,
+    GATE_ID,
     HALT_ID,
     JOBS_ID,
     OFF_ID,
     ON_ID,
     PAIR_ID,
+    ROLES_ID,
+    ROLES_MODAL_ID,
+    TERMINAL_ID,
     ask_modal_payload,
     ask_text_from_interaction,
     handle_gateway_interaction,
@@ -74,10 +80,34 @@ def test_panel_buttons_and_interaction_parse():
     buttons = host_panel_components(False)
     ids = [item["custom_id"] for item in buttons[0]["components"]]
     assert ids == [ON_ID, OFF_ID]
-    assert [item["custom_id"] for item in buttons[1]["components"]] == [PAIR_ID, HALT_ID]
+    assert [item["custom_id"] for item in buttons[1]["components"]] == [
+        PAIR_ID,
+        HALT_ID,
+        GATE_ID,
+        ROLES_ID,
+    ]
+    auto = buttons[1]["components"][2]
+    assert auto["label"] == "Auto"
+    gated = host_panel_components(False, write_gate=True)
+    assert gated[1]["components"][2]["label"] == "Gate"
     armed = host_panel_components(True)
     assert ASK_ID in [item["custom_id"] for item in armed[0]["components"]]
-    assert [item["custom_id"] for item in armed[1]["components"]] == [PAIR_ID, HALT_ID]
+    assert [item["custom_id"] for item in armed[1]["components"]] == [
+        PAIR_ID,
+        HALT_ID,
+        GATE_ID,
+        ROLES_ID,
+    ]
+    assert [item["custom_id"] for item in armed[2]["components"]] == [
+        FILES_ID,
+        TERMINAL_ID,
+        BROWSER_ID,
+    ]
+    paired = host_panel_components(True, paired=True)
+    pair_btn = paired[1]["components"][0]
+    assert pair_btn["custom_id"] == PAIR_ID
+    assert pair_btn["label"] == "Paired"
+    assert pair_btn["disabled"] is True
     assert panel_action_from_interaction(
         {"type": 3, "data": {"custom_id": ON_ID}}
     ) == "on"
@@ -92,7 +122,7 @@ def test_panel_buttons_and_interaction_parse():
         True,
         jobs=[{"run_id": "run-1", "intake_text": "what is Discord OS?", "status": "completed"}],
     )
-    assert jobs[2]["components"][0]["custom_id"] == JOBS_ID
+    assert jobs[3]["components"][0]["custom_id"] == JOBS_ID
     assert panel_action_from_interaction(
         {"type": 3, "data": {"custom_id": JOBS_ID, "values": ["run-1"]}}
     ) == "job"
@@ -317,3 +347,74 @@ def test_launchd_plist_contains_channel_and_service_env(tmp_path: Path):
     assert "DISCORD_OS_SERVICE" in plist
     assert "PYTHONUNBUFFERED" in plist
     assert "KeepAlive" in plist
+
+
+def test_files_button_opens_workspace(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "files.sqlite3")
+    store.initialize()
+    store.set_host_control("ch", armed=True)
+    store.add_operator("owner-7", role="owner")
+    opened: list[tuple[str, str]] = []
+
+    def runner(argv, *, cwd=None):
+        opened.append((tuple(argv), cwd))
+
+    def opener(request, timeout=10):
+        return _FakeResponse(b"")
+
+    action = handle_gateway_interaction(
+        store,
+        "ch",
+        {
+            "type": 3,
+            "id": "ix",
+            "token": "tok",
+            "application_id": "app-1",
+            "user": {"id": "owner-7"},
+            "data": {"custom_id": FILES_ID},
+            "message": {"id": "panel-1"},
+        },
+        opener=opener,
+        host_roots=[tmp_path],
+        host_runner=runner,
+    )
+    assert action == "files"
+    assert opened
+    store.close()
+
+
+def test_roles_modal_adds_operator_role(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "roles.sqlite3")
+    store.initialize()
+    store.add_operator("owner-7", role="owner")
+
+    def opener(request, timeout=10):
+        return _FakeResponse(b"")
+
+    action = handle_gateway_interaction(
+        store,
+        "ch",
+        {
+            "type": 5,
+            "id": "ix",
+            "token": "tok",
+            "application_id": "app-1",
+            "user": {"id": "owner-7"},
+            "data": {
+                "custom_id": ROLES_MODAL_ID,
+                "components": [
+                    {
+                        "type": 1,
+                        "components": [
+                            {"type": 4, "custom_id": "discord-os:roles-text", "value": "role-99"}
+                        ],
+                    }
+                ],
+            },
+            "message": {"id": "panel-1"},
+        },
+        opener=opener,
+    )
+    assert action == "roles"
+    assert "role-99" in store.list_operator_roles()
+    store.close()

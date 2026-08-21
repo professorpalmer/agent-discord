@@ -17,9 +17,19 @@ ASK_TEXT_ID = "discord-os:ask-text"
 JOBS_ID = "discord-os:jobs"
 PAIR_ID = "discord-os:pair"
 HALT_ID = "discord-os:halt"
+GATE_ID = "discord-os:gate"
+ROLES_ID = "discord-os:roles"
+ROLES_MODAL_ID = "discord-os:roles-modal"
+ROLES_TEXT_ID = "discord-os:roles-text"
+FILES_ID = "discord-os:files"
+TERMINAL_ID = "discord-os:terminal"
+BROWSER_ID = "discord-os:browser"
+BROWSER_MODAL_ID = "discord-os:browser-modal"
+BROWSER_TEXT_ID = "discord-os:browser-text"
 COMPONENT_ROW = 1
 BUTTON = 2
 STYLE_PRIMARY = 1
+STYLE_SECONDARY = 2
 STYLE_SUCCESS = 3
 STYLE_DANGER = 4
 INTERACTION_MESSAGE_COMPONENT = 3
@@ -34,6 +44,8 @@ def host_panel_components(
     *,
     confirm_off: bool = False,
     jobs: Optional[list[dict[str, Any]]] = None,
+    paired: bool = False,
+    write_gate: bool = False,
 ) -> list[dict[str, Any]]:
     if confirm_off:
         rows = [
@@ -90,7 +102,8 @@ def host_panel_components(
                         "type": BUTTON,
                         "style": STYLE_PRIMARY,
                         "custom_id": PAIR_ID,
-                        "label": "Pair",
+                        "label": "Paired" if paired else "Pair",
+                        "disabled": bool(paired),
                     },
                     {
                         "type": BUTTON,
@@ -98,9 +111,47 @@ def host_panel_components(
                         "custom_id": HALT_ID,
                         "label": "Halt",
                     },
+                    {
+                        "type": BUTTON,
+                        "style": STYLE_DANGER if write_gate else STYLE_SUCCESS,
+                        "custom_id": GATE_ID,
+                        "label": "Gate" if write_gate else "Auto",
+                    },
+                    {
+                        "type": BUTTON,
+                        "style": STYLE_SECONDARY,
+                        "custom_id": ROLES_ID,
+                        "label": "Roles",
+                    },
                 ],
             },
         ]
+        if armed:
+            rows.append(
+                {
+                    "type": COMPONENT_ROW,
+                    "components": [
+                        {
+                            "type": BUTTON,
+                            "style": STYLE_SECONDARY,
+                            "custom_id": FILES_ID,
+                            "label": "Files",
+                        },
+                        {
+                            "type": BUTTON,
+                            "style": STYLE_SECONDARY,
+                            "custom_id": TERMINAL_ID,
+                            "label": "Terminal",
+                        },
+                        {
+                            "type": BUTTON,
+                            "style": STYLE_SECONDARY,
+                            "custom_id": BROWSER_ID,
+                            "label": "Browser",
+                        },
+                    ],
+                }
+            )
     options = _job_select_options(jobs or ())
     if options:
         rows.append(action_row([string_select(JOBS_ID, options)]))
@@ -128,24 +179,54 @@ def _job_select_options(jobs: list[dict[str, Any]] | tuple[dict[str, Any], ...])
 
 
 def ask_modal_payload() -> dict[str, Any]:
+    return _text_modal_payload(
+        ASK_MODAL_ID,
+        "Ask Discord OS",
+        ASK_TEXT_ID,
+        "Task",
+        "What should this host do?",
+        max_length=4000,
+    )
+
+
+def roles_modal_payload() -> dict[str, Any]:
+    return _text_modal_payload(
+        ROLES_MODAL_ID,
+        "Add operator role",
+        ROLES_TEXT_ID,
+        "Discord role id",
+        "Snowflake role id",
+        max_length=32,
+    )
+
+
+def _text_modal_payload(
+    custom_id: str,
+    title: str,
+    field_id: str,
+    label: str,
+    placeholder: str,
+    *,
+    max_length: int,
+) -> dict[str, Any]:
     return {
         "type": CALLBACK_MODAL,
         "data": {
-            "custom_id": ASK_MODAL_ID,
-            "title": "Ask Discord OS",
+            "custom_id": custom_id,
+            "title": title,
             "components": [
                 {
                     "type": COMPONENT_ROW,
                     "components": [
                         {
                             "type": 4,
-                            "custom_id": ASK_TEXT_ID,
+                            "custom_id": field_id,
                             "style": 2,
-                            "label": "Task",
+                            "label": label,
                             "min_length": 1,
-                            "max_length": 4000,
+                            "max_length": max_length,
                             "required": True,
-                            "placeholder": "What should this host do?",
+                            "placeholder": placeholder,
                         }
                     ],
                 }
@@ -179,7 +260,9 @@ def _first_text_input(components: Any) -> str:
     for item in components or ():
         if not isinstance(item, dict):
             continue
-        if str(item.get("custom_id") or "") == ASK_TEXT_ID:
+        if int(item.get("type") or 0) == 4:
+            return str(item.get("value") or "").strip()
+        if str(item.get("custom_id") or "") in {ASK_TEXT_ID, ROLES_TEXT_ID, BROWSER_TEXT_ID}:
             return str(item.get("value") or "").strip()
         nested = _first_text_input(item.get("components"))
         if nested:
@@ -206,20 +289,31 @@ def host_panel_payload(
         is_spend_halted,
         session_spend_usd,
         spend_cap_usd,
+        writes_need_approval,
     )
 
     spend_usd = 0.0
     cap_usd = None
     halted = False
+    write_gate = False
+    paired = False
+    operator_count = 0
+    role_count = 0
+    last_job = ""
     if store is not None:
         try:
             spend_usd = session_spend_usd(store)
             cap_usd = spend_cap_usd(store)
             halted = is_spend_halted(store)
+            write_gate = writes_need_approval(store)
         except Exception:
             spend_usd = 0.0
             cap_usd = None
             halted = False
+            write_gate = False
+        paired = _panel_paired(store)
+        operator_count, role_count = _panel_acl_counts(store)
+        last_job = _panel_last_job(store, channel_id)
     card = host_card(
         armed=armed,
         channel_id=channel_id,
@@ -228,9 +322,20 @@ def host_panel_payload(
         spend_usd=spend_usd,
         cap_usd=cap_usd,
         halted=halted,
+        paired=paired,
+        operator_count=operator_count,
+        role_count=role_count,
+        last_job=last_job,
+        write_gate=write_gate,
     )
     return card.v2_payload(
-        rows=host_panel_components(armed, confirm_off=confirm_off, jobs=jobs)
+        rows=host_panel_components(
+            armed,
+            confirm_off=confirm_off,
+            jobs=jobs,
+            paired=paired,
+            write_gate=write_gate,
+        )
     )
 
 
@@ -252,6 +357,16 @@ def panel_action_from_custom_id(custom_id: str) -> Optional[str]:
         return "pair"
     if raw == HALT_ID:
         return "halt"
+    if raw == GATE_ID:
+        return "gate"
+    if raw == ROLES_ID:
+        return "roles"
+    if raw == FILES_ID:
+        return "files"
+    if raw == TERMINAL_ID:
+        return "terminal"
+    if raw == BROWSER_ID:
+        return "browser"
     return None
 
 
@@ -366,6 +481,9 @@ def handle_gateway_interaction(
     on_ask: Optional[Callable[[str], None]] = None,
     on_power: Optional[Callable[[bool], None]] = None,
     on_job: Optional[Callable[[str, str], None]] = None,
+    host_roots: Optional[list[Any]] = None,
+    host_runner: Any = None,
+    browser_open: Any = None,
 ) -> Optional[str]:
     """ACK within Discord's 3s window, then paint the panel. Best-effort."""
 
@@ -398,26 +516,17 @@ def handle_gateway_interaction(
         return job.action
 
     if int(payload.get("type") or 0) == INTERACTION_MODAL_SUBMIT:
-        text = ask_text_from_interaction(payload)
-        interaction_id, ix_token = interaction_ids(payload)
-        if interaction_id and ix_token:
-            try:
-                from agent_discord.discord.rest import callback_interaction
-
-                callback_interaction(
-                    interaction_id=interaction_id,
-                    interaction_token=ix_token,
-                    payload={"type": CALLBACK_DEFERRED_UPDATE},
-                    opener=opener,
-                )
-            except Exception:
-                pass
-        if text and callable(on_ask):
-            try:
-                on_ask(text)
-            except Exception:
-                pass
-        return "ask" if text else None
+        return _handle_modal_submit(
+            store,
+            channel_id,
+            payload,
+            token=token,
+            opener=opener,
+            on_ask=on_ask,
+            host_roots=host_roots,
+            host_runner=host_runner,
+            browser_open=browser_open,
+        )
 
     action = panel_action_from_interaction(payload)
     if action is None:
@@ -425,12 +534,16 @@ def handle_gateway_interaction(
     if action == "ask":
         _ack_interaction(payload, ask_modal_payload(), opener=opener)
         return action
+    if action == "roles":
+        _ack_interaction(payload, roles_modal_payload(), opener=opener)
+        return action
     _ack_interaction(payload, {"type": CALLBACK_DEFERRED_UPDATE}, opener=opener)
 
     from agent_discord.orchestration.service import (
         author_may_operate,
         seed_owner_if_empty,
         toggle_spend_halted,
+        toggle_write_gate,
     )
 
     user_id = interaction_user_id(payload)
@@ -445,6 +558,17 @@ def handle_gateway_interaction(
         return "denied"
     if action == "halt":
         toggle_spend_halted(store)
+    if action == "gate":
+        toggle_write_gate(store)
+    if action in {"files", "terminal", "browser"}:
+        if _channel_armed(store, channel_id):
+            _open_host_surface(
+                action,
+                "" if action == "browser" else ".",
+                roots=host_roots,
+                runner=host_runner,
+                browser_open=browser_open,
+            )
     if action == "job":
         try:
             _publish_job_card(store, channel_id, payload, token=token, opener=opener)
@@ -464,14 +588,18 @@ def handle_gateway_interaction(
     if confirm_off:
         armed = True
     try:
-        _paint_host_panel(
+        _paint_after_ack(
             store,
             channel_id,
+            payload,
             token=token,
-            message_id=_remember_panel_message(store, channel_id, payload),
             armed=armed,
             confirm_off=confirm_off,
             opener=opener,
+        )
+        print(
+            f"panel painted action={action} paired={int(_panel_paired(store))}",
+            flush=True,
         )
     except Exception as exc:
         print(f"panel paint failed: {exc}", flush=True)
@@ -499,6 +627,160 @@ def _remember_panel_message(store: Any, channel_id: str, payload: Mapping[str, A
     return message_id
 
 
+def _handle_modal_submit(
+    store: Any,
+    channel_id: str,
+    payload: Mapping[str, Any],
+    *,
+    token: str,
+    opener: Any,
+    on_ask: Optional[Callable[[str], None]],
+    host_roots: Optional[list[Any]],
+    host_runner: Any,
+    browser_open: Any,
+) -> Optional[str]:
+    data = payload.get("data")
+    custom_id = ""
+    if isinstance(data, dict):
+        custom_id = str(data.get("custom_id") or "")
+    text = _first_text_input(data.get("components") if isinstance(data, dict) else None)
+    _ack_interaction(payload, {"type": CALLBACK_DEFERRED_UPDATE}, opener=opener)
+    if custom_id == ASK_MODAL_ID:
+        if text and callable(on_ask):
+            try:
+                on_ask(text)
+            except Exception:
+                pass
+        return "ask" if text else None
+    from agent_discord.orchestration.service import author_may_operate
+
+    user_id = interaction_user_id(payload)
+    role_ids = interaction_role_ids(payload)
+    if not author_may_operate(store, user_id, custom_id, role_ids=role_ids):
+        return "denied"
+    if custom_id == ROLES_MODAL_ID:
+        role_id = text.strip()
+        writer = getattr(store, "add_operator_role", None)
+        if role_id and callable(writer):
+            try:
+                writer(role_id)
+                print(f"panel role {role_id}", flush=True)
+            except Exception as exc:
+                print(f"panel role failed: {exc}", flush=True)
+        _paint_interaction(
+            store, channel_id, payload, token=token, opener=opener, confirm_off=False
+        )
+        return "roles"
+    if custom_id == BROWSER_MODAL_ID:
+        if _channel_armed(store, channel_id):
+            _open_host_surface(
+                "browser",
+                text,
+                roots=host_roots,
+                runner=host_runner,
+                browser_open=browser_open,
+            )
+        _paint_interaction(
+            store, channel_id, payload, token=token, opener=opener, confirm_off=False
+        )
+        return "browser"
+    return None
+
+
+def _open_host_surface(
+    surface: str,
+    target: str,
+    *,
+    roots: Optional[list[Any]],
+    runner: Any,
+    browser_open: Any,
+) -> None:
+    from agent_discord.host.actions import run_host_action
+
+    try:
+        run_host_action(
+            surface,
+            target,
+            roots=list(roots or ()),
+            runner=runner,
+            browser_open=browser_open,
+        )
+        print(f"panel opened {surface}", flush=True)
+    except Exception as exc:
+        print(f"panel open failed: {exc}", flush=True)
+
+
+def _paint_interaction(
+    store: Any,
+    channel_id: str,
+    payload: Mapping[str, Any],
+    *,
+    token: str,
+    opener: Any,
+    confirm_off: bool,
+) -> None:
+    try:
+        _paint_after_ack(
+            store,
+            channel_id,
+            payload,
+            token=token,
+            armed=_channel_armed(store, channel_id),
+            confirm_off=confirm_off,
+            opener=opener,
+        )
+    except Exception as exc:
+        print(f"panel paint failed: {exc}", flush=True)
+
+
+def _panel_acl_counts(store: Any) -> tuple[int, int]:
+    operators = 0
+    roles = 0
+    lister = getattr(store, "list_operators", None)
+    if callable(lister):
+        try:
+            operators = len(list(lister()))
+        except Exception:
+            operators = 0
+    role_lister = getattr(store, "list_operator_roles", None)
+    if callable(role_lister):
+        try:
+            roles = len(list(role_lister()))
+        except Exception:
+            roles = 0
+    return operators, roles
+
+
+def _panel_last_job(store: Any, channel_id: str) -> str:
+    jobs = _panel_jobs(store, channel_id)
+    if not jobs:
+        return ""
+    job = jobs[0]
+    status = str(job.get("status") or "").strip()
+    text = str(job.get("summary") or job.get("intake_text") or "").replace("\n", " ")
+    text = " ".join(text.split())
+    if len(text) > 80:
+        text = text[:77] + "..."
+    if status and text:
+        return f"Last: {status} · {text}"
+    if status:
+        return f"Last: {status}"
+    if text:
+        return f"Last: {text}"
+    return ""
+
+
+def _panel_paired(store: Any) -> bool:
+    if store is None:
+        return False
+    from agent_discord.orchestration.service import operators_configured
+
+    try:
+        return bool(operators_configured(store))
+    except Exception:
+        return False
+
+
 def _panel_jobs(store: Any, channel_id: str) -> list[dict[str, Any]]:
     reader = getattr(store, "list_recent_jobs", None)
     if not callable(reader):
@@ -509,15 +791,48 @@ def _panel_jobs(store: Any, channel_id: str) -> list[dict[str, Any]]:
         return []
 
 
-def _panel_avatar(token: str, opener: Any) -> str:
-    if not token.strip():
-        return ""
-    try:
-        from agent_discord.discord.rest import bot_avatar_url, fetch_bot_identity
+def _paint_after_ack(
+    store: Any,
+    channel_id: str,
+    payload: Mapping[str, Any],
+    *,
+    token: str,
+    armed: bool,
+    confirm_off: bool,
+    opener: Any,
+) -> None:
+    panel = host_panel_payload(
+        armed,
+        channel_id=channel_id,
+        confirm_off=confirm_off,
+        jobs=_panel_jobs(store, channel_id),
+        store=store,
+    )
+    message = {"flags": panel["flags"], "components": panel["components"]}
+    application_id = str(payload.get("application_id") or "")
+    _interaction_id, ix_token = interaction_ids(payload)
+    _ = _interaction_id
+    if application_id and ix_token:
+        from agent_discord.discord.rest import edit_original_interaction
 
-        return bot_avatar_url(fetch_bot_identity(token=token, opener=opener))
-    except Exception:
-        return ""
+        edit_original_interaction(
+            application_id=application_id,
+            interaction_token=ix_token,
+            payload=message,
+            opener=opener,
+        )
+        _remember_panel_message(store, channel_id, payload)
+        return
+    _paint_host_panel(
+        store,
+        channel_id,
+        token=token,
+        message_id=_remember_panel_message(store, channel_id, payload),
+        armed=armed,
+        confirm_off=confirm_off,
+        opener=opener,
+        panel=panel,
+    )
 
 
 def _paint_host_panel(
@@ -529,19 +844,20 @@ def _paint_host_panel(
     armed: bool,
     confirm_off: bool,
     opener: Any,
+    panel: Optional[dict[str, Any]] = None,
 ) -> None:
     if not token.strip() or not message_id:
         return
     from agent_discord.discord.rest import edit_channel_message
 
-    panel = host_panel_payload(
-        armed,
-        channel_id=channel_id,
-        confirm_off=confirm_off,
-        jobs=_panel_jobs(store, channel_id),
-        avatar_url=_panel_avatar(token, opener),
-        store=store,
-    )
+    if panel is None:
+        panel = host_panel_payload(
+            armed,
+            channel_id=channel_id,
+            confirm_off=confirm_off,
+            jobs=_panel_jobs(store, channel_id),
+            store=store,
+        )
     edit_channel_message(
         token=token,
         channel_id=channel_id,
