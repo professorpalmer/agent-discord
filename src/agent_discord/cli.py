@@ -140,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print machine-readable receipt JSON",
     )
+    p_run.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Fan out a swarm of N analyze workers (2-5) then aggregate",
+    )
 
     p_put = sub.add_parser("put", help="Store a file as a Discord object (attachment + pointer)")
     p_put.add_argument("path", type=Path, help="Local file to upload")
@@ -476,6 +482,7 @@ def cmd_run(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
             guild_id=args.guild_id,
             thread_id=args.thread_id,
             message_id=args.message_id,
+            metadata={"workers": getattr(args, "workers", 0) or 0},
         )
         receipt = orch.run_task(intake)
     finally:
@@ -803,6 +810,7 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         research=ResearchMemoryStore(store),
         max_object_bytes=config.discord_max_object_bytes,
         workspace=config.workspace,
+        retry_backoff_s=15.0,
     )
     claimed = False
     exit_code = 0
@@ -969,6 +977,22 @@ def _start_panel_gateway(
         if isinstance(data, dict):
             custom_id = str(data.get("custom_id") or "")
         print(f"panel click {custom_id}", flush=True)
+        def on_job(action: str, run_id: str) -> None:
+            if action == "retry" and asks is not None:
+                asks.put(f"retry run {run_id}")
+                return
+            if action == "approve" and asks is not None:
+                asks.put(f"implement the approved plan for {run_id}")
+                return
+            if action != "cancel":
+                return
+            try:
+                from agent_discord.contracts import TaskStatus
+
+                store.update_run(run_id, status=TaskStatus.CANCELLED, summary="cancelled")
+            except Exception:
+                pass
+
         handle_gateway_interaction(
             store,
             channel_id,
@@ -976,6 +1000,7 @@ def _start_panel_gateway(
             token=token,
             on_ask=on_ask,
             on_power=set_presence,
+            on_job=on_job,
         )
 
     def loop() -> None:

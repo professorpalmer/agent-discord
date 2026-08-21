@@ -30,6 +30,8 @@ STYLE_DANGER = 4
 STYLE_LINK = 5
 
 ACTIVITY_WATCHING = 3
+ACTIVITY_NAME_MAX = 128
+CUSTOM_ID_MAX = 100
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
@@ -72,6 +74,22 @@ def section(texts: Sequence[str], accessory: dict[str, Any]) -> dict[str, Any]:
 
 def action_row(components: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"type": TYPE_ACTION_ROW, "components": list(components)[:5]}
+
+
+def button(
+    label: str,
+    custom_id: str,
+    *,
+    style: int = STYLE_SECONDARY,
+    disabled: bool = False,
+) -> dict[str, Any]:
+    return {
+        "type": TYPE_BUTTON,
+        "style": int(style),
+        "label": (label or "Button")[:80],
+        "custom_id": (custom_id or "")[:CUSTOM_ID_MAX],
+        "disabled": bool(disabled),
+    }
 
 
 def thumbnail(url: str, *, description: str = "Discord OS") -> dict[str, Any]:
@@ -154,6 +172,16 @@ def presence_update(*, status: str, name: str) -> dict[str, Any]:
             "afk": False,
         },
     }
+
+
+def working_presence(task_label: str) -> dict[str, Any]:
+    """Gateway-ready presence payload. Does not send on the wire."""
+
+    label = " ".join((task_label or "").split()) or "a task"
+    name = f"Working on {label}"
+    if len(name) > ACTIVITY_NAME_MAX:
+        name = name[:ACTIVITY_NAME_MAX]
+    return presence_update(status="dnd", name=name)
 
 
 def _basename(filename: str) -> str:

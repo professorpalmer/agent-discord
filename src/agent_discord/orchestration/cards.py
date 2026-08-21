@@ -9,8 +9,12 @@ from agent_discord import PRODUCT_NAME
 from agent_discord.contracts import RunReceipt, TaskStatus
 from agent_discord.discord.layout import (
     FLAG_COMPONENTS_V2,
+    STYLE_DANGER,
+    STYLE_PRIMARY,
+    STYLE_SUCCESS,
     action_row,
     attachment_component,
+    button,
     container,
     discord_time,
     iter_component_text,
@@ -21,6 +25,7 @@ from agent_discord.discord.layout import (
     text_display,
     thumbnail,
 )
+from agent_discord.host.actions import job_custom_id
 from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
 
 
@@ -32,6 +37,8 @@ COLOR_LIVE = 0x248046
 COLOR_WORK = 0xC27C0E
 COLOR_FAIL = 0xDA373C
 COLOR_FILE = 0x5865F2
+CODE_BODY_MAX = 1800
+_TRUNCATION_NOTE = f"Truncated to {CODE_BODY_MAX} characters."
 
 _PROVIDER_LABELS = {"openrouter": "OpenRouter"}
 _SURFACE_LABELS = {
@@ -63,6 +70,7 @@ class CardMessage:
     link_url: str = ""
     updated_ts: Optional[int] = None
     avatar_url: str = ""
+    rows: tuple[dict[str, Any], ...] = ()
 
     @property
     def text(self) -> str:
@@ -128,7 +136,8 @@ class CardMessage:
         children.append(text_display(redact_text_markers("\n\n".join(body_parts))))
         if self.file_name:
             children.append(attachment_component(self.file_name))
-        extra = list(rows or [])
+        extra = list(self.rows)
+        extra.extend(rows or [])
         if self.link_url:
             extra.append(action_row([link_button("Open", self.link_url)]))
         if extra:
@@ -246,7 +255,6 @@ def progress_card(
     percent: Optional[float] = None,
     run_id: str = "",
 ) -> CardMessage:
-    _ = run_id
     title = _title_case(stage) or "Working"
     body = redact_text_markers(message or "")
     return CardMessage(
@@ -255,6 +263,61 @@ def progress_card(
         description=body,
         color=COLOR_WORK,
         percent=percent,
+        rows=_job_rows(run_id),
+    )
+
+
+def working_card(
+    *,
+    task_label: str = "",
+    message: str = "",
+    percent: Optional[float] = None,
+    run_id: str = "",
+) -> CardMessage:
+    title = _title_case(task_label) or "Working"
+    return CardMessage(
+        kind="WORKING",
+        title=title,
+        description=redact_text_markers(message or ""),
+        color=COLOR_WORK,
+        percent=percent,
+        rows=_job_rows(run_id),
+    )
+
+
+def code_card(language: str, code: str, title: str = "Code") -> CardMessage:
+    return CardMessage(
+        kind="CODE",
+        title=title or "Code",
+        description=_bounded_fence(language, code),
+        color=COLOR_FILE,
+    )
+
+
+def diff_card(
+    diff_text: str,
+    filename: str = "patch.diff",
+    title: str = "Diff",
+) -> CardMessage:
+    heading = f"`{filename}`" if filename else ""
+    body = _bounded_fence("diff", diff_text)
+    description = f"{heading}\n{body}" if heading else body
+    return CardMessage(
+        kind="DIFF",
+        title=title or "Diff",
+        description=description,
+        color=COLOR_FILE,
+    )
+
+
+def job_action_row(run_id: str) -> dict[str, Any]:
+    rid = (run_id or "").strip()
+    return action_row(
+        [
+            button("Approve", job_custom_id("approve", rid), style=STYLE_SUCCESS),
+            button("Cancel", job_custom_id("cancel", rid), style=STYLE_DANGER),
+            button("Retry", job_custom_id("retry", rid), style=STYLE_PRIMARY),
+        ]
     )
 
 
@@ -512,6 +575,32 @@ def edit_card(
 def _title_case(stage: str) -> str:
     raw = (stage or "").replace("_", " ").strip()
     return raw[:1].upper() + raw[1:] if raw else ""
+
+
+def _job_rows(run_id: str) -> tuple[dict[str, Any], ...]:
+    if not (run_id or "").strip():
+        return ()
+    return (job_action_row(run_id),)
+
+
+def _fence_language(language: str) -> str:
+    return "".join((language or "").split()).replace("`", "")[:32]
+
+
+def _bounded_fence(language: str, source: str) -> str:
+    cleaned = redact_text_markers(source or "")
+    truncated = len(cleaned) > CODE_BODY_MAX
+    if truncated:
+        cleaned = cleaned[:CODE_BODY_MAX]
+    fence = "```"
+    while fence in cleaned:
+        fence += "`"
+    lang = _fence_language(language)
+    opener = f"{fence}{lang}" if lang else fence
+    block = f"{opener}\n{cleaned}\n{fence}"
+    if truncated:
+        return f"{block}\n{_TRUNCATION_NOTE}"
+    return block
 
 
 MappingLike = dict[str, Any]

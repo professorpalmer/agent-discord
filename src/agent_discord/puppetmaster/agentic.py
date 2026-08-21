@@ -24,7 +24,8 @@ from agent_discord.contracts import (
 )
 from agent_discord.keys.vault import KeyVault
 from agent_discord.puppetmaster.backend import (
-    _parse_progress_line,
+    TokenStreamBuffer,
+    _event_from_cli_line,
     _parse_safe_cli_completion,
     _safe_dispatch_prompt,
 )
@@ -267,6 +268,7 @@ class AgenticPuppetmasterBackend:
             command.extend(["--allow-non-worktree", "--disable-codegraph"])
         if workdir:
             command.extend(["--cwd", workdir])
+        command.append("--json-lines")
 
         child_env = dict(self.env) if self.env is not None else dict(os.environ)
         secret = self._resolve_secret()
@@ -322,6 +324,7 @@ class AgenticPuppetmasterBackend:
 
         done_stdout = False
         done_stderr = False
+        token_buffer = TokenStreamBuffer()
         try:
             while not (done_stdout and done_stderr):
                 if not done_stdout:
@@ -330,7 +333,7 @@ class AgenticPuppetmasterBackend:
                         if line is None:
                             done_stdout = True
                         else:
-                            event = _parse_progress_line(line, pin.canonical)
+                            event = _event_from_cli_line(line, pin.canonical, token_buffer)
                             if event is not None:
                                 yield event
                     except queue.Empty:

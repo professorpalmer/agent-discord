@@ -15,14 +15,42 @@ from agent_discord.host.actions import (
     HostActionError,
     allow_browser_url,
     confine_host_path,
+    job_action_from_custom_id,
+    job_custom_id,
     run_host_action,
 )
+from agent_discord.host.panel import ASK_ID, JOBS_ID, OFF_ID, ON_ID, panel_action_from_custom_id
 from agent_discord.host.verbs import handle_open_message, is_open_command, parse_open_command
 from agent_discord.orchestration.cards import CARD_PREFIX
 from agent_discord.orchestration.listen import drain_inbound, should_dispatch_inbound
 from agent_discord.orchestration.orchestrator import AgentOrchestrator
 from agent_discord.persistence.sqlite import SQLiteStore
 from agent_discord.puppetmaster.fake import FakePuppetmasterBackend
+
+
+def test_job_custom_ids_parse_without_host_power():
+    approve = job_custom_id("approve", "run-9")
+    cancel = job_custom_id("cancel", "run-9")
+    retry = job_custom_id("retry", "run-9")
+    assert approve == "discord-os:job:approve:run-9"
+    assert job_action_from_custom_id(approve) == job_action_from_custom_id(
+        "discord-os:job:approve:run-9"
+    )
+    parsed = job_action_from_custom_id(approve)
+    assert parsed is not None
+    assert parsed.action == "approve"
+    assert parsed.run_id == "run-9"
+    assert job_action_from_custom_id(cancel).action == "cancel"
+    assert job_action_from_custom_id(retry).action == "retry"
+    assert job_action_from_custom_id(ON_ID) is None
+    assert job_action_from_custom_id(OFF_ID) is None
+    assert job_action_from_custom_id(ASK_ID) is None
+    assert job_action_from_custom_id(JOBS_ID) is None
+    assert panel_action_from_custom_id(approve) is None
+    assert panel_action_from_custom_id(cancel) is None
+    assert panel_action_from_custom_id(retry) is None
+    for custom_id in (approve, cancel, retry):
+        assert custom_id not in {ON_ID, OFF_ID, ASK_ID, JOBS_ID}
 
 
 def test_confine_host_path_stays_inside_roots(tmp_path: Path):

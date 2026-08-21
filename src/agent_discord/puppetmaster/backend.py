@@ -24,7 +24,27 @@ from agent_discord.contracts import (
     UsageReceipt,
 )
 from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
-from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
+from agent_discord.redaction import (
+    ALLOWED_REASONING_KEYS,
+    redact_text_markers,
+    strip_forbidden_keys,
+)
+
+TOKEN_TEXT_LIMIT = 1500
+STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
+_TOKEN_EVENT_TYPES = frozenset({"token", "delta", "reasoning"})
+_PHASE_ALIASES = {
+    "think": "thinking",
+    "thought": "thinking",
+    "thoughts": "thinking",
+    "planning": "plan",
+    "coding": "code",
+    "implement": "code",
+    "implementation": "code",
+    "working": "code",
+    "complete": "done",
+    "completed": "done",
+}
 
 
 @dataclass
@@ -235,6 +255,7 @@ class PuppetmasterCliBackend:
         workdir = str(self.cwd) if self.cwd else None
         if workdir:
             command.extend(["--cwd", workdir])
+        command.append("--json-lines")
         command.append(prompt)
 
         try:
@@ -285,6 +306,7 @@ class PuppetmasterCliBackend:
 
         done_stdout = False
         done_stderr = False
+        token_buffer = TokenStreamBuffer()
         try:
             while not (done_stdout and done_stderr):
                 if not done_stdout:
@@ -293,7 +315,7 @@ class PuppetmasterCliBackend:
                         if line is None:
                             done_stdout = True
                         else:
-                            event = _parse_progress_line(line, pin.canonical)
+                            event = _event_from_cli_line(line, pin.canonical, token_buffer)
                             if event is not None:
                                 yield event
                     except queue.Empty:
@@ -498,6 +520,145 @@ _PROGRESS_RE = re.compile(r"progress[:\s]+(\d+(?:\.\d+)?)%?", re.IGNORECASE)
 _STAGE_RE = re.compile(r"stage[:\s]+([a-zA-Z0-9_\-]+)", re.IGNORECASE)
 
 
+@dataclass
+class TokenStreamBuffer:
+    """Visible token window and current stream phase for one CLI run."""
+
+    phase: str = "thinking"
+    text: str = ""
+
+    def extend(self, chunk: str) -> str:
+        if chunk:
+            self.text = (self.text + chunk)[-TOKEN_TEXT_LIMIT:]
+        return self.text
+
+    def set_phase(self, phase: str) -> str:
+        self.phase = _normalize_stream_phase(phase, self.phase)
+        return self.phase
+
+
+def _normalize_stream_phase(raw: str, default: str = "thinking") -> str:
+    stage = (raw or "").strip().lower()
+    stage = _PHASE_ALIASES.get(stage, stage)
+    if stage in STREAM_PHASES:
+        return stage
+    return default if default in STREAM_PHASES else "thinking"
+
+
+def _extract_token_text(cleaned: dict[str, Any], event_type: str) -> str:
+    if event_type == "delta":
+        keys = ("text", "content", "delta")
+    elif event_type == "token":
+        keys = ("content", "text", "token")
+    else:
+        keys = (
+            "summary",
+            "reasoning_summary",
+            "plan",
+            "plan_summary",
+            "approach",
+            "findings",
+            "text",
+            "content",
+        )
+    for key in keys:
+        value = cleaned.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _parse_token_line(
+    line: str,
+    model: str,
+    buffer: Optional[TokenStreamBuffer] = None,
+) -> Optional[DispatchEvent]:
+    """Parse a token/reasoning/delta NDJSON line into a safe PROGRESS event.
+
+    Raw chain-of-thought keys are stripped; only allowed reasoning summaries
+    and visible token text are kept. Accumulated text is bounded.
+    """
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    parsed = _try_parse_json(raw)
+    if not isinstance(parsed, dict):
+        return None
+    event_type = str(parsed.get("type") or "").strip().lower()
+    if event_type not in _TOKEN_EVENT_TYPES:
+        return None
+    cleaned = strip_forbidden_keys(parsed)
+    if not isinstance(cleaned, dict):
+        return None
+    event_type = str(cleaned.get("type") or event_type).strip().lower()
+    if event_type not in _TOKEN_EVENT_TYPES:
+        return None
+
+    state = buffer if buffer is not None else TokenStreamBuffer()
+    explicit = cleaned.get("stage") or cleaned.get("stream_phase") or cleaned.get("phase")
+    if explicit:
+        state.set_phase(str(explicit))
+    elif event_type == "reasoning":
+        if any(cleaned.get(key) for key in ("plan", "plan_summary")):
+            state.set_phase("plan")
+        else:
+            state.set_phase("thinking")
+
+    chunk = redact_text_markers(_extract_token_text(cleaned, event_type))
+    if not chunk.strip():
+        return None
+    state.extend(chunk)
+
+    percent: Optional[float] = None
+    if "percent" in cleaned:
+        try:
+            percent = float(cleaned["percent"])
+        except (TypeError, ValueError):
+            percent = None
+
+    details: dict[str, Any] = {
+        "token": event_type in {"token", "delta"},
+        "stream_phase": state.phase,
+        "token_text": state.text,
+    }
+    if model:
+        details["model"] = model
+    for key in ALLOWED_REASONING_KEYS:
+        value = cleaned.get(key)
+        if value:
+            details[key] = value
+
+    return DispatchEvent(
+        kind=EventKind.PROGRESS,
+        summary=ProgressSummary(
+            stage=state.phase,
+            message=chunk[:500],
+            percent=percent,
+            details=details,
+        ),
+    )
+
+
+def _event_from_cli_line(
+    line: str,
+    model: str,
+    buffer: TokenStreamBuffer,
+) -> Optional[DispatchEvent]:
+    """Prefer token/reasoning NDJSON; fall back to existing progress lines."""
+    token_event = _parse_token_line(line, model, buffer=buffer)
+    if token_event is not None:
+        return token_event
+    progress = _parse_progress_line(line, model)
+    if progress is not None and progress.summary.stage:
+        stage = _PHASE_ALIASES.get(
+            progress.summary.stage.strip().lower(),
+            progress.summary.stage.strip().lower(),
+        )
+        if stage in STREAM_PHASES:
+            buffer.set_phase(stage)
+    return progress
+
+
 def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
     """Parse a single CLI output line into a safe PROGRESS event when possible."""
     raw = (line or "").strip()
@@ -522,6 +683,9 @@ def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
 
     parsed = _try_parse_json(raw)
     if isinstance(parsed, dict):
+        event_type = str(parsed.get("type") or "").strip().lower()
+        if event_type in _TOKEN_EVENT_TYPES:
+            return None
         cleaned = strip_forbidden_keys(parsed)
         if isinstance(cleaned, dict):
             if "percent" in cleaned:
@@ -535,7 +699,7 @@ def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:
                 message = str(cleaned["message"])[:500]
             elif "summary" in cleaned:
                 message = str(cleaned["summary"])[:500]
-            details = {k: v for k, v in cleaned.items() if k in {"reasoning_summary", "plan", "plan_summary", "approach", "findings"}}
+            details = {k: v for k, v in cleaned.items() if k in ALLOWED_REASONING_KEYS}
             return DispatchEvent(
                 kind=EventKind.PROGRESS,
                 summary=ProgressSummary(

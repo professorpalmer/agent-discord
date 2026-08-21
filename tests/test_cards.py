@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from agent_discord.discord.layout import (
+    ACTIVITY_NAME_MAX,
+    CUSTOM_ID_MAX,
     FLAG_COMPONENTS_V2,
+    TYPE_ACTION_ROW,
     TYPE_CONTAINER,
     TYPE_FILE,
     TYPE_MEDIA_GALLERY,
@@ -12,15 +15,22 @@ from agent_discord.discord.layout import (
     iter_component_text,
     progress_bar,
     status_table,
+    working_presence,
 )
+from agent_discord.host.panel import ASK_ID, OFF_ID, ON_ID
 from agent_discord.orchestration.cards import (
     CARD_FOOTER,
+    CODE_BODY_MAX,
     COLOR_IDLE,
     COLOR_LIVE,
+    code_card,
     connect_card,
+    diff_card,
     host_card,
+    job_action_row,
     object_card,
     progress_card,
+    working_card,
 )
 
 
@@ -88,3 +98,80 @@ def test_image_object_uses_media_gallery():
     kinds = [child["type"] for child in card.v2_components()[0]["components"]]
     assert TYPE_MEDIA_GALLERY in kinds
     assert TYPE_FILE not in kinds
+
+
+def _button_custom_ids(card) -> list[str]:
+    ids: list[str] = []
+    for child in card.v2_components()[0]["components"]:
+        if child.get("type") != TYPE_ACTION_ROW:
+            continue
+        for item in child.get("components") or []:
+            custom_id = item.get("custom_id")
+            if custom_id:
+                ids.append(str(custom_id))
+    return ids
+
+
+def test_code_card_uses_language_fence():
+    card = code_card("python", "print(1)\n")
+    assert card.title == "Code"
+    assert card.description.startswith("```python\n")
+    assert card.description.rstrip().endswith("```")
+    assert "print(1)" in card.description
+    hidden = code_card("python", "<thinking>secret</thinking>\nprint(1)")
+    assert "secret" not in hidden.description
+    assert "[redacted]" in hidden.description
+    long_src = "x" * (CODE_BODY_MAX + 40)
+    clipped = code_card("python", long_src)
+    assert f"Truncated to {CODE_BODY_MAX} characters." in clipped.description
+    assert ("x" * (CODE_BODY_MAX + 1)) not in clipped.description
+
+
+def test_diff_card_uses_diff_fence():
+    patch = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+    card = diff_card(patch, filename="app.py")
+    assert card.title == "Diff"
+    assert "```diff\n" in card.description
+    assert "`app.py`" in card.description
+    assert "+new" in card.description
+    assert "-old" in card.description
+
+
+def test_working_card_attaches_job_action_row():
+    idle = working_card(task_label="wave 2", message="editing cards")
+    assert idle.title == "Wave 2"
+    assert _button_custom_ids(idle) == []
+    live = working_card(task_label="wave 2", message="editing cards", run_id="run-22")
+    ids = _button_custom_ids(live)
+    assert ids == [
+        "discord-os:job:approve:run-22",
+        "discord-os:job:cancel:run-22",
+        "discord-os:job:retry:run-22",
+    ]
+    assert "run-22" not in live.text
+    progress = progress_card(stage="work", message="card edited", run_id="live-card")
+    assert _button_custom_ids(progress)
+    assert all(item.startswith("discord-os:job:") for item in _button_custom_ids(progress))
+
+
+def test_job_action_custom_ids_stay_under_discord_limit():
+    row = job_action_row("r" * 200)
+    assert row["type"] == TYPE_ACTION_ROW
+    ids = [item["custom_id"] for item in row["components"]]
+    assert [item[: item.rfind(":") + 1] for item in ids] == [
+        "discord-os:job:approve:",
+        "discord-os:job:cancel:",
+        "discord-os:job:retry:",
+    ]
+    assert all(len(item) <= CUSTOM_ID_MAX for item in ids)
+    assert all(item not in {ON_ID, OFF_ID, ASK_ID} for item in ids)
+
+
+def test_working_presence_name_and_status():
+    payload = working_presence("wave 2")
+    assert payload["op"] == 3
+    assert payload["d"]["status"] == "dnd"
+    assert payload["d"]["activities"][0]["name"] == "Working on wave 2"
+    long_name = working_presence("x" * 200)["d"]["activities"][0]["name"]
+    assert long_name.startswith("Working on ")
+    assert len(long_name) <= ACTIVITY_NAME_MAX

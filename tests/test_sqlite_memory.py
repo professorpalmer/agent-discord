@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from agent_discord.contracts import EventKind
 from agent_discord.discord.errors import GatewayOwnershipError
 from agent_discord.discord.gateway import SqliteGatewayOwnerRegistry
-from agent_discord.persistence.sqlite import SQLiteStore
+from agent_discord.persistence.sqlite import PREFERENCE_KINDS, SQLiteStore
 
 
 def test_memory_provenance_and_recall(tmp_path: Path):
@@ -142,4 +143,161 @@ def test_sqlite_gateway_steal_dead_cli_owner(tmp_path: Path):
     store.claim_gateway("tokfp2", "discord-os-cli-99999999-dead0001")
     store.claim_gateway("tokfp2", "discord-os-cli-88888888-next0001")
     assert store.gateway_owner("tokfp2") == "discord-os-cli-88888888-next0001"
+    store.close()
+
+
+def test_preference_set_get_list(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "prefs.sqlite3")
+    store.initialize()
+    store.set_preference("ws", "concise", "true")
+    store.set_preference("ws", "formatter", "black", kind="style")
+    assert store.get_preference("ws", "concise") == "true"
+    assert store.get_preference("ws", "formatter") == "black"
+    assert store.get_preference("ws", "missing") is None
+    assert store.get_preference("other", "concise") is None
+
+    listed = store.list_preferences("ws")
+    keys = {row["key"] for row in listed}
+    assert keys == {"concise", "formatter"}
+    kinds = {row["kind"] for row in listed}
+    assert kinds == {"preference", "style"}
+
+    styles = store.list_preferences("ws", kind="style")
+    assert len(styles) == 1
+    assert styles[0]["key"] == "formatter"
+    assert styles[0]["value"] == "black"
+    assert styles[0]["kind"] == "style"
+
+    store.set_preference("ws", "concise", "false")
+    assert store.get_preference("ws", "concise") == "false"
+    store.close()
+
+
+def test_preference_failure_record_and_list(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "fail.sqlite3")
+    store.initialize()
+    store.record_failure("ws", "lint", "ImportError: missing module")
+    store.record_failure("ws", "deploy", "timeout after 30s")
+    store.set_preference("ws", "concise", "true")
+
+    failures = store.list_failures("ws", limit=8)
+    assert len(failures) == 2
+    assert all(row["kind"] == "failure" for row in failures)
+    keys = {row["key"] for row in failures}
+    assert keys == {"lint", "deploy"}
+    assert store.list_failures("ws", limit=1)[0]["key"] in keys
+    store.close()
+
+
+def test_preference_redaction(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "redact.sqlite3")
+    store.initialize()
+    store.set_preference("ws", "note", "keep <thinking>SECRET</thinking>")
+    stored = store.get_preference("ws", "note")
+    assert stored == "keep [redacted]"
+    assert stored is not None and "SECRET" not in stored
+
+    store.record_failure("ws", "fp1", "boom <thinking>SECRET</thinking>")
+    failures = store.list_failures("ws")
+    assert failures[0]["value"] == "boom [redacted]"
+    assert "SECRET" not in failures[0]["value"]
+
+    block = store.prompt_memory_block("ws")
+    assert "SECRET" not in block
+    assert "[redacted]" in block
+    store.close()
+
+
+def test_prompt_memory_block_is_short_and_capped(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "prompt.sqlite3")
+    store.initialize()
+    assert store.prompt_memory_block("ws") == ""
+    store.set_preference("ws", "concise", "true")
+    store.set_preference("ws", "formatter", "black", kind="style")
+    store.record_failure("ws", "lint", "ImportError")
+    block = store.prompt_memory_block("ws")
+    assert "[preferences]" in block
+    assert "concise=true" in block
+    assert "[style]" in block
+    assert "formatter=black" in block
+    assert "[failures]" in block
+    assert "lint: ImportError" in block
+
+    for index in range(20):
+        store.record_failure("ws", f"fp-{index}", "x" * 400)
+    capped = store.prompt_memory_block("ws")
+    assert len(capped) <= 1500
+    store.close()
+
+
+def test_preferences_migrate_on_existing_db(tmp_path: Path):
+    db = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_bindings (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            guild_id TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(workspace_id, channel_id)
+        );
+        CREATE TABLE IF NOT EXISTS artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(db)
+    store.initialize()
+    cols = {
+        row["name"]
+        for row in store._connection().execute("PRAGMA table_info(preferences)").fetchall()
+    }
+    assert {"workspace_id", "key", "value", "kind", "updated_at"} <= cols
+    store.set_preference("ws", "concise", "true")
+    assert store.get_preference("ws", "concise") == "true"
+    store.close()
+
+
+def test_preferences_migrate_adds_missing_columns(tmp_path: Path):
+    db = tmp_path / "partial.sqlite3"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """
+        CREATE TABLE preferences (
+            workspace_id TEXT,
+            key TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(db)
+    store.initialize()
+    store.set_preference("ws", "formatter", "black", kind="style")
+    assert store.get_preference("ws", "formatter") == "black"
+    styles = store.list_preferences("ws", kind="style")
+    assert len(styles) == 1
+    assert styles[0]["kind"] == "style"
+    store.close()
+
+
+def test_preference_rejects_unknown_kind(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "kind.sqlite3")
+    store.initialize()
+    with pytest.raises(ValueError):
+        store.set_preference("ws", "x", "y", kind="unknown")
+    assert PREFERENCE_KINDS == frozenset({"preference", "style", "failure"})
     store.close()

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Discord OS 0.4.0 card preview</title>
+<style>
+  :root { --bg:#1e1f22; --card:#2b2d31; --ink:#f2f3f5; --dim:#b5bac1; --ok:#248046; --no:#da373c; --go:#5865f2; }
+  body { margin:0; background:radial-gradient(1200px 600px at 10% 0%, #3b3d44 0%, var(--bg) 45%); color:var(--ink); font-family:"gg sans", "Source Serif 4", Georgia, serif; padding:32px; }
+  h1 { font-size:42px; letter-spacing:-0.03em; margin:0 0 8px; }
+  .sub { color:var(--dim); margin:0 0 28px; max-width:46rem; }
+  main { display:grid; gap:18px; max-width:720px; }
+  article { background:var(--card); padding:18px 20px 16px; }
+  article h2 { margin:0 0 10px; font-size:18px; font-family:ui-sans-serif,system-ui; }
+  pre { margin:0; white-space:pre-wrap; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color:#dbdee1; }
+  .row { display:flex; gap:8px; margin-top:14px; }
+  .row span { font:12px/1 ui-sans-serif,system-ui; padding:8px 12px; color:white; }
+  .ok { background:var(--ok); } .no { background:var(--no); } .go { background:var(--go); }
+  footer { margin-top:28px; color:var(--dim); font:13px/1.5 ui-sans-serif,system-ui; }
+</style></head>
+<body>
+<h1>Discord OS</h1>
+<p class="sub">0.4.0 local validation of Kimi next-level cards. Presence: Working on token-level streaming. Voice intake: run tests. Widget: {&#x27;run_id&#x27;: &#x27;run-stream&#x27;, &#x27;stage&#x27;: &#x27;code&#x27;, &#x27;percent&#x27;: 72.0, &#x27;summary&#x27;: &#x27;flush every 350ms&#x27;}.</p>
+<main>
+<article style="border-left:6px solid #c27c0e"><h2>Thinking stream</h2><pre>Thinking
+def parse_token_line(line, model):</pre><div class="row"><span class="ok">Approve</span><span class="no">Cancel</span><span class="go">Retry</span></div></article><article style="border-left:6px solid #c27c0e"><h2>Plan</h2><pre>Plan
+Edit backend.py then flush the Discord card.</pre><div class="row"><span class="ok">Approve</span><span class="no">Cancel</span><span class="go">Retry</span></div></article><article style="border-left:6px solid #5865f2"><h2>Code card</h2><pre>voice.py
+```python
+def spoken_command_to_intake(transcript):
+    return transcript.removeprefix(&#x27;hey discord os&#x27;).strip()
+
+```</pre></article><article style="border-left:6px solid #5865f2"><h2>Diff card</h2><pre>Diff
+`orchestrator.py`
+```diff
+@@ -1,3 +1,6 @@
+ def handle():
+-    send_card(discord, ch, bits)
++    send_card(discord, ch, progress_card(stage=&#x27;plan&#x27;, message=bits))
+
+```</pre></article><article style="border-left:6px solid #c27c0e"><h2>Working</h2><pre>Swarm audit
+explore / pipeline-mapper / decision-explainer</pre><div class="row"><span class="ok">Approve</span><span class="no">Cancel</span><span class="go">Retry</span></div></article>
+</main>
+<footer>Generated from live code_card / diff_card / progress_card / working_presence. Not a live Discord capture.</footer>
+</body></html>

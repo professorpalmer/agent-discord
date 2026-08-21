@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
 from agent_discord.contracts import (
@@ -26,11 +27,41 @@ from agent_discord.orchestration.cards import (
     receipt_card,
     send_card,
 )
-from agent_discord.orchestration.routing import compute_dispatch_mode
+from agent_discord.orchestration.routing import (
+    MODE_IMPLEMENT,
+    compute_dispatch_mode,
+    swarm_worker_count,
+)
 from agent_discord.persistence.research import ResearchMemoryStore
 from agent_discord.persistence.sqlite import SQLiteStore
 from agent_discord.puppetmaster.models import DEFAULT_MODEL_PIN
 from agent_discord.redaction import redact_text_markers, strip_forbidden_keys
+
+TOKEN_CARD_FLUSH_SECONDS = 0.35
+TOKEN_TEXT_LIMIT = 1500
+_THREAD_PHASES = frozenset({"thinking", "plan", "code"})
+_STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
+_PHASE_THREAD_LABELS = {
+    "thinking": "Thinking",
+    "plan": "Plan",
+    "code": "Code",
+}
+_SWARM_ROLES = (
+    "explore",
+    "pipeline-mapper",
+    "decision-explainer",
+    "conflict-auditor",
+    "test-coverage-reviewer",
+)
+_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limited", "ratelimited")
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _is_token_stream(details: Mapping[str, Any]) -> bool:
+    return bool(details.get("token")) or "stream_phase" in details
 
 
 class AgentOrchestrator:
@@ -47,6 +78,8 @@ class AgentOrchestrator:
         research: Optional[ResearchMemoryStore] = None,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         workspace: Optional[Path] = None,
+        retry_backoff_s: float = 0.0,
+        presence: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -57,7 +90,10 @@ class AgentOrchestrator:
         self.research = research
         self.max_object_bytes = max_object_bytes
         self.workspace = Path(workspace) if workspace is not None else None
+        self.retry_backoff_s = float(retry_backoff_s)
+        self.presence = presence
         self._run_status: dict[str, TaskStatus] = {}
+        self._checkpoints: dict[str, dict[str, Any]] = {}
 
     def run_task(self, intake: TaskIntake) -> RunReceipt:
         pin = self.backend.resolve_model(self.model)
@@ -94,6 +130,7 @@ class AgentOrchestrator:
             status=TaskStatus.RUNNING,
         )
         self._run_status[run_id] = TaskStatus.RUNNING
+        self._set_presence("dnd", intake.text)
 
         if intake.message_id:
             self.store.bind_inbound_message(
@@ -126,6 +163,22 @@ class AgentOrchestrator:
                 limit=8,
             )
         )
+        pref_block = ""
+        reader = getattr(self.store, "prompt_memory_block", None)
+        if callable(reader):
+            try:
+                pref_block = reader(intake.workspace_id) or ""
+            except Exception:
+                pref_block = ""
+        if pref_block:
+            memories.insert(
+                0,
+                {
+                    "memory_id": "preferences",
+                    "content": pref_block,
+                    "source": "preferences",
+                },
+            )
         binding = self.store.get_binding(intake.workspace_id, intake.channel_id) or {}
         research_context = self._optional_research_context(intake)
         provenance: dict[str, Any] = {
@@ -160,16 +213,33 @@ class AgentOrchestrator:
         progress_items: list[ProgressSummary] = []
         progress_message_id: Optional[str] = None
         job_thread_id = intake.thread_id
+        requested_workers = None
+        thread_history = ""
+        if intake.metadata:
+            requested_workers = intake.metadata.get("workers")
+            bits = intake.metadata.get("thread_history") or []
+            if bits:
+                thread_history = "\n".join(str(item)[:200] for item in list(bits)[:6])
+        workers = swarm_worker_count(intake.text, requested_workers)
+        prompt = intake.text.strip()
+        if thread_history:
+            prompt = f"{prompt}\n\nThread history:\n{thread_history}"
+        compute_mode = compute_dispatch_mode(intake.text)
+        extra_meta = dict(intake.metadata) if intake.metadata else {}
+        extra_meta.update(
+            {
+                "channel_id": intake.channel_id,
+                "compute_mode": compute_mode,
+                "workers": workers,
+            }
+        )
         request = DispatchRequest(
             task_id=task_id,
             run_id=run_id,
-            prompt=intake.text,
+            prompt=prompt,
             model=pin.canonical,
             context=snapshot,
-            metadata={
-                "channel_id": intake.channel_id,
-                "compute_mode": compute_dispatch_mode(intake.text),
-            },
+            metadata=extra_meta,
         )
         if self.post_progress_to_discord and self.discord is not None:
             start_card = progress_card(
@@ -190,6 +260,16 @@ class AgentOrchestrator:
                     progress_message_id,
                     intake.text,
                 )
+        if workers:
+            return self.dispatch_swarm(
+                intake,
+                request,
+                task_id=task_id,
+                run_id=run_id,
+                workers=workers,
+                job_thread_id=job_thread_id,
+                progress_message_id=progress_message_id,
+            )
         stream = getattr(self.backend, "stream", None)
         if callable(stream):
             events_iter = stream(request)
@@ -197,6 +277,62 @@ class AgentOrchestrator:
         else:
             result = self.backend.dispatch(request)
             events_iter = iter(result.events)
+
+        token_text = ""
+        token_dirty = False
+        last_flush_at = _monotonic()
+        last_thread_phase: Optional[str] = None
+        last_percent: Optional[float] = None
+        stream_stage = "start"
+        stream_error: Optional[str] = None
+
+        def flush_token_card(*, force: bool = False) -> None:
+            nonlocal progress_message_id, token_dirty, last_flush_at
+            if not token_dirty or not token_text:
+                return
+            if not force and (_monotonic() - last_flush_at) < TOKEN_CARD_FLUSH_SECONDS:
+                return
+            if self.post_progress_to_discord and self.discord is not None:
+                card = progress_card(
+                    stage=stream_stage,
+                    message=token_text,
+                    percent=last_percent,
+                    run_id=run_id,
+                )
+                progress_message_id = self._post_or_edit_progress(
+                    intake.channel_id,
+                    card,
+                    thread_id=job_thread_id,
+                    message_id=progress_message_id,
+                )
+            token_dirty = False
+            last_flush_at = _monotonic()
+
+        def post_phase_thread(stage: str) -> None:
+            nonlocal last_thread_phase
+            if stage not in _THREAD_PHASES or stage == last_thread_phase:
+                return
+            last_thread_phase = stage
+            if not (
+                job_thread_id
+                and self.post_progress_to_discord
+                and self.discord is not None
+            ):
+                return
+            try:
+                send_card(
+                    self.discord,
+                    intake.channel_id,
+                    progress_card(
+                        stage=stage,
+                        message=_PHASE_THREAD_LABELS.get(stage, stage),
+                        percent=last_percent,
+                        run_id=run_id,
+                    ),
+                    thread_id=job_thread_id,
+                )
+            except Exception:
+                pass
 
         for event in events_iter:
             safe_details = strip_forbidden_keys(dict(event.summary.details))
@@ -225,11 +361,32 @@ class AgentOrchestrator:
                 },
                 source="backend",
             )
+            if event.kind == EventKind.ERROR:
+                stream_error = summary.message
             if (
                 self.post_progress_to_discord
                 and self.discord is not None
                 and event.kind == EventKind.PROGRESS
             ):
+                if summary.percent is not None:
+                    last_percent = summary.percent
+                if _is_token_stream(summary.details):
+                    incoming = str(summary.details.get("token_text") or "")
+                    if incoming:
+                        token_text = incoming[-TOKEN_TEXT_LIMIT:]
+                    elif summary.message:
+                        token_text = (token_text + summary.message)[-TOKEN_TEXT_LIMIT:]
+                    token_dirty = True
+                    phase = str(
+                        summary.details.get("stream_phase") or summary.stage or stream_stage
+                    )
+                    if phase in _STREAM_PHASES:
+                        stream_stage = phase
+                    flush_token_card()
+                    post_phase_thread(stream_stage)
+                    continue
+                if summary.stage:
+                    stream_stage = summary.stage
                 card = progress_card(
                     stage=summary.stage,
                     message=summary.message,
@@ -242,6 +399,7 @@ class AgentOrchestrator:
                     thread_id=job_thread_id,
                     message_id=progress_message_id,
                 )
+                last_flush_at = _monotonic()
                 if job_thread_id and summary.details:
                     reasoning_bits = []
                     for key in ("reasoning_summary", "plan", "plan_summary", "approach", "findings"):
@@ -253,19 +411,66 @@ class AgentOrchestrator:
                             send_card(
                                 self.discord,
                                 intake.channel_id,
-                                "\n".join(reasoning_bits),
+                                progress_card(
+                                    stage="plan",
+                                    message="\n".join(reasoning_bits),
+                                    percent=last_percent,
+                                    run_id=run_id,
+                                ),
                                 thread_id=job_thread_id,
                             )
                         except Exception:
                             pass
 
+        flush_token_card(force=True)
+
         if result is None:
+            streamed_status = self.backend.status(run_id)
+            if streamed_status in {
+                TaskStatus.PENDING,
+                TaskStatus.RUNNING,
+                TaskStatus.PROGRESS,
+            }:
+                streamed_status = (
+                    TaskStatus.FAILED if stream_error else TaskStatus.COMPLETED
+                )
             result = DispatchResult(
                 run_id=run_id,
-                status=self._run_status.get(run_id, TaskStatus.COMPLETED),
+                status=streamed_status,
                 events=tuple(progress_items),
                 final_summary=progress_items[-1].message if progress_items else "completed",
+                error=stream_error,
             )
+            self._run_status[run_id] = streamed_status
+
+        if (
+            result.status == TaskStatus.FAILED
+            and self._is_rate_limit(result.error)
+        ):
+            self._sleep_retry()
+            retry_request = DispatchRequest(
+                task_id=request.task_id,
+                run_id=request.run_id,
+                prompt=request.prompt,
+                model=request.model,
+                context=request.context,
+                metadata={**dict(request.metadata), "resume": "rate_limit"},
+            )
+            result = self.backend.dispatch(retry_request)
+            self._run_status[run_id] = result.status
+
+        if result.status == TaskStatus.FAILED:
+            writer = getattr(self.store, "record_failure", None)
+            if callable(writer):
+                try:
+                    writer(
+                        intake.workspace_id,
+                        run_id,
+                        result.error or result.final_summary or "failed",
+                    )
+                except Exception:
+                    pass
+            self._rollback_on_red(run_id)
 
         receipt_artifacts: list[ArtifactRef] = []
         for art in result.artifacts:
@@ -323,14 +528,245 @@ class AgentOrchestrator:
         )
 
         if self.post_progress_to_discord and self.discord is not None:
-            send_card(
-                self.discord,
-                intake.channel_id,
-                card,
-                thread_id=job_thread_id,
-            )
+            if progress_message_id:
+                try:
+                    edit_card(
+                        self.discord,
+                        intake.channel_id,
+                        progress_message_id,
+                        card,
+                    )
+                except Exception:
+                    send_card(
+                        self.discord,
+                        intake.channel_id,
+                        card,
+                        thread_id=job_thread_id,
+                    )
+            else:
+                send_card(
+                    self.discord,
+                    intake.channel_id,
+                    card,
+                    thread_id=job_thread_id,
+                )
+        self._set_presence("idle", "Discord OS")
 
         return receipt
+
+    def dispatch_swarm(
+        self,
+        intake: TaskIntake,
+        request: DispatchRequest,
+        *,
+        task_id: str,
+        run_id: str,
+        workers: int,
+        job_thread_id: Optional[str],
+        progress_message_id: Optional[str],
+    ) -> RunReceipt:
+        """Fan out one analyze worker per role, then optional implement handoff."""
+
+        roles = list(_SWARM_ROLES[: max(2, min(int(workers), 5))])
+        summaries: list[str] = []
+        progress_items: list[ProgressSummary] = []
+        for index, role in enumerate(roles):
+            child_id = f"{run_id}-{role}"
+            child_thread = job_thread_id
+            if self.post_progress_to_discord and self.discord is not None and progress_message_id:
+                try:
+                    starter = getattr(self.discord, "start_thread", None)
+                    if callable(starter):
+                        started = starter(
+                            intake.channel_id,
+                            progress_message_id,
+                            name=f"{role}"[:90],
+                        )
+                        child_thread = getattr(started, "thread_id", None) or child_thread
+                except Exception:
+                    pass
+            child = DispatchRequest(
+                task_id=task_id,
+                run_id=child_id,
+                prompt=f"[{role}] {request.prompt}",
+                model=request.model,
+                context=request.context,
+                metadata={**dict(request.metadata), "role": role, "parent_run_id": run_id},
+            )
+            result = self.backend.dispatch(child)
+            bit = redact_text_markers(result.final_summary or role)
+            summaries.append(f"{role}: {bit}")
+            progress_items.append(
+                ProgressSummary(
+                    stage=role,
+                    message=bit,
+                    percent=round((index + 1) * 100.0 / (len(roles) + 1), 1),
+                )
+            )
+            if self.post_progress_to_discord and self.discord is not None:
+                try:
+                    send_card(
+                        self.discord,
+                        intake.channel_id,
+                        progress_card(
+                            stage=role,
+                            message=bit,
+                            percent=progress_items[-1].percent,
+                            run_id=child_id,
+                        ),
+                        thread_id=child_thread,
+                    )
+                except Exception:
+                    pass
+
+        stitched = "\n".join(summaries)
+        final_status = TaskStatus.COMPLETED
+        handoff_error: Optional[str] = None
+        if compute_dispatch_mode(intake.text) == MODE_IMPLEMENT or "implement" in intake.text.lower():
+            handoff = DispatchRequest(
+                task_id=task_id,
+                run_id=f"{run_id}-implement",
+                prompt=f"Implement from swarm findings:\n{stitched}\n\nTask:\n{intake.text}",
+                model=request.model,
+                context=request.context,
+                metadata={**dict(request.metadata), "compute_mode": MODE_IMPLEMENT, "handoff": True},
+            )
+            handoff_result = self.backend.dispatch(handoff)
+            stitched = f"{stitched}\nimplement: {handoff_result.final_summary}"
+            final_status = handoff_result.status
+            handoff_error = handoff_result.error
+
+        self.store.update_run(
+            run_id,
+            status=final_status,
+            summary=redact_text_markers(stitched),
+            error=handoff_error,
+        )
+        self._run_status[run_id] = final_status
+        receipt = RunReceipt(
+            task_id=task_id,
+            run_id=run_id,
+            status=final_status,
+            summary=redact_text_markers(stitched),
+            progress=tuple(progress_items),
+            error=handoff_error,
+        )
+        if self.post_progress_to_discord and self.discord is not None:
+            card = receipt_card(receipt)
+            if progress_message_id:
+                try:
+                    edit_card(self.discord, intake.channel_id, progress_message_id, card)
+                except Exception:
+                    send_card(self.discord, intake.channel_id, card, thread_id=job_thread_id)
+            else:
+                send_card(self.discord, intake.channel_id, card, thread_id=job_thread_id)
+        self._event(
+            task_id,
+            run_id,
+            EventKind.RECEIPT,
+            "swarm receipt",
+            {"workers": len(roles), "roles": roles},
+            source="orchestrator",
+        )
+        self._set_presence("idle", "Discord OS")
+        return receipt
+
+    def apply_job_action(self, action: str, run_id: str) -> dict[str, Any]:
+        """Approve / cancel / retry a stored run. Best-effort, no raises."""
+
+        verb = (action or "").strip().lower()
+        run = self.store.get_run(run_id) or {}
+        if verb == "cancel":
+            try:
+                self.backend.cancel(run_id)
+            except Exception:
+                pass
+            try:
+                self.store.update_run(run_id, status=TaskStatus.CANCELLED, summary="cancelled")
+            except Exception:
+                pass
+            return {"action": verb, "run_id": run_id, "status": "cancelled"}
+        if verb == "retry":
+            task_id = str(run.get("task_id") or "")
+            task = self.store.get_task(task_id) if task_id else None
+            text = ""
+            if task:
+                text = str(task.get("intake_text") or "")
+            if text:
+                return {
+                    "action": verb,
+                    "run_id": run_id,
+                    "status": "queued",
+                    "intake_text": text,
+                }
+            return {"action": verb, "run_id": run_id, "status": "missing"}
+        if verb == "approve":
+            return {"action": verb, "run_id": run_id, "status": "approved"}
+        return {"action": verb, "run_id": run_id, "status": "ignored"}
+
+    def _set_presence(self, status: str, name: str) -> None:
+        sender = self.presence
+        if not callable(sender):
+            return
+        label = " ".join((name or "").split())[:80] or "Discord OS"
+        if status == "dnd" and not label.startswith("Working"):
+            label = f"Working on {label}"
+        try:
+            sender(status, label)
+        except Exception:
+            pass
+
+    def _is_rate_limit(self, error: Optional[str]) -> bool:
+        raw = (error or "").lower()
+        return any(marker in raw for marker in _RATE_LIMIT_MARKERS)
+
+    def _sleep_retry(self) -> None:
+        delay = max(0.0, float(self.retry_backoff_s))
+        if delay:
+            time.sleep(delay)
+
+    def _rollback_on_red(self, run_id: str) -> None:
+        """Best-effort reverse of the uncommitted workspace diff after a failed run."""
+
+        if self.workspace is None:
+            return
+        root = Path(self.workspace)
+        if not (root / ".git").exists():
+            return
+        try:
+            import subprocess
+
+            snapped = subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=str(root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:
+            return
+        diff = snapped.stdout or ""
+        if not diff.strip():
+            stored = self._checkpoints.get(run_id) or {}
+            diff = str(stored.get("diff") or "")
+        if not diff.strip():
+            return
+        path = root / ".agent-discord" / "checkpoints" / f"{run_id}.patch"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(diff, encoding="utf-8")
+            self._checkpoints[run_id] = {"diff": diff}
+            subprocess.run(
+                ["git", "apply", "-R", "--whitespace=nowarn", str(path)],
+                cwd=str(root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:
+            return
 
     def _duplicate_receipt(self, message_id: str) -> RunReceipt:
         """Return prior receipt or an explicit ignored-duplicate result (no re-dispatch)."""

@@ -2,6 +2,9 @@
 
 Paths stay inside configured roots. Browser URLs are allowlisted.
 The runner is injectable so tests never spawn a GUI.
+
+Job button custom_ids are parsed here as intent only — they never
+toggle host power or dispatch Puppetmaster.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 from urllib.parse import urlparse
+
+from agent_discord.discord.layout import CUSTOM_ID_MAX
 
 
 class HostActionError(ValueError):
@@ -31,8 +36,39 @@ class HostActionResult:
 CommandRunner = Callable[..., object]
 
 SURFACES = frozenset({"terminal", "files", "browser"})
+JOB_ID_PREFIX = "discord-os:job:"
+JOB_VERBS = frozenset({"approve", "cancel", "retry"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DISCORD_HOSTS = frozenset({"discord.com", "canary.discord.com", "ptb.discord.com"})
+
+
+@dataclass(frozen=True)
+class JobAction:
+    """Parsed job-button intent. Does not start or stop a Puppetmaster run."""
+
+    action: str
+    run_id: str
+
+
+def job_custom_id(action: str, run_id: str) -> str:
+    verb = (action or "").strip().lower()
+    prefix = f"{JOB_ID_PREFIX}{verb}:"
+    budget = max(0, CUSTOM_ID_MAX - len(prefix))
+    return prefix + (run_id or "").strip()[:budget]
+
+
+def job_action_from_custom_id(custom_id: str) -> Optional[JobAction]:
+    raw = (custom_id or "").strip()
+    if not raw.startswith(JOB_ID_PREFIX):
+        return None
+    rest = raw[len(JOB_ID_PREFIX) :]
+    verb, sep, run_id = rest.partition(":")
+    if not sep or verb not in JOB_VERBS:
+        return None
+    run_id = run_id.strip()
+    if not run_id:
+        return None
+    return JobAction(action=verb, run_id=run_id)
 
 
 def run_host_action(
