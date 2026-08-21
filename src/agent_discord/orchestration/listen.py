@@ -29,8 +29,10 @@ from agent_discord.orchestration.service import (
     is_spend_halted,
     parse_schedule_command,
     seed_spend_cap_from_env,
+    seed_write_gate_from_env,
     session_spend_usd,
     spend_cap_usd,
+    writes_need_approval,
 )
 
 DISCORD_EPOCH_MS = 1_420_070_400_000
@@ -206,6 +208,7 @@ def drain_inbound(
     store = getattr(orchestrator, "store", None)
     if store is not None:
         seed_spend_cap_from_env(store, env)
+        seed_write_gate_from_env(store, env)
     seed_ms = since_ms if since_ms is not None else default_listen_since_ms()
     seeder = getattr(store, "seed_listen_watermark", None)
     if callable(seeder):
@@ -515,14 +518,17 @@ def publish_host_card(
     spend = 0.0
     cap = None
     halted = False
+    write_gate = False
     try:
         spend = session_spend_usd(store)
         cap = spend_cap_usd(store)
         halted = is_spend_halted(store)
+        write_gate = writes_need_approval(store)
     except Exception:
         spend = 0.0
         cap = None
         halted = False
+        write_gate = False
     jobs: list[dict] = []
     lister = getattr(store, "list_recent_jobs", None)
     if callable(lister):
@@ -546,6 +552,7 @@ def publish_host_card(
         spend_usd=spend,
         cap_usd=cap,
         halted=halted,
+        write_gate=write_gate,
     )
     control = None
     reader = getattr(store, "get_host_control", None)
@@ -555,7 +562,7 @@ def publish_host_card(
         except Exception:
             control = None
     card_id = str((control or {}).get("card_message_id") or "")
-    buttons = host_panel_components(armed, jobs=jobs)
+    buttons = host_panel_components(armed, jobs=jobs, write_gate=write_gate)
     if card_id:
         try:
             edit_card(discord, channel_id, card_id, card, components=buttons)

@@ -9,4 +9,4 @@ REPO_URL = "https://github.com/professorpalmer/discord-os"
 CLI_OWNER_PREFIX = "discord-os-cli-"
 LEGACY_CLI_OWNER_PREFIX = "agent-discord-cli-"
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"

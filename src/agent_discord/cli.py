@@ -27,6 +27,7 @@ from agent_discord.config import (
     keys_dir,
     load_config,
     resolve_compute,
+    resolve_puppetmaster_cli,
 )
 from agent_discord.contracts import (
     DiscordObjectRef,
@@ -508,6 +509,7 @@ def cmd_spend(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         format_usd,
         is_spend_halted,
         seed_spend_cap_from_env,
+        seed_write_gate_from_env,
         session_spend_usd,
         set_spend_cap_usd,
         set_spend_halted,
@@ -519,6 +521,7 @@ def cmd_spend(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     store.initialize()
     try:
         seed_spend_cap_from_env(store)
+        seed_write_gate_from_env(store)
         if args.cap is not None:
             set_spend_cap_usd(store, args.cap)
         if args.halt:
@@ -641,16 +644,17 @@ def _select_backend(config: AppConfig) -> PuppetmasterBackend:
             ),
             api_token=config.marionette_api_token,
         )
+    cli = resolve_puppetmaster_cli(config.puppetmaster_cli)
     resolution = resolve_compute(config)
     if resolution.mode == "agentic":
         return AgenticPuppetmasterBackend(
-            cli=config.puppetmaster_cli,
+            cli=cli,
             pin=AGENTIC_MODEL_PIN,
             cwd=config.puppetmaster_cwd,
             vault=KeyVault(keys_dir(config)),
         )
     return PuppetmasterCliBackend(
-        cli=config.puppetmaster_cli,
+        cli=cli,
         pin=DEFAULT_MODEL_PIN,
         cwd=config.puppetmaster_cwd,
     )
@@ -901,9 +905,13 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
     store = SQLiteStore(config.database_path)
     store.initialize()
     store.seed_owner_from_env()
-    from agent_discord.orchestration.service import seed_spend_cap_from_env
+    from agent_discord.orchestration.service import (
+        seed_spend_cap_from_env,
+        seed_write_gate_from_env,
+    )
 
     seed_spend_cap_from_env(store)
+    seed_write_gate_from_env(store)
     resolution = resolve_compute(config)
     if args.fake:
         provider = FakeDiscordMCPProvider(persist_dir=config.workspace / "fake_discord")
@@ -968,6 +976,11 @@ def cmd_listen(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
                     discord_down=discord_down,
                     asks=asks,
                     orch=orch,
+                    host_roots=(
+                        (config.puppetmaster_cwd, config.workspace)
+                        if config.host_actions
+                        else ()
+                    ),
                 )
         while True:
             if discord_down.is_set():
@@ -1066,6 +1079,7 @@ def _start_panel_gateway(
     discord_down: threading.Event,
     asks: Optional[Queue[str]] = None,
     orch: Any = None,
+    host_roots: tuple[Any, ...] = (),
 ) -> None:
     presence: list[Any] = []
 
@@ -1131,6 +1145,7 @@ def _start_panel_gateway(
             on_ask=on_ask,
             on_power=set_presence,
             on_job=on_job,
+            host_roots=list(host_roots),
         )
 
     def loop() -> None:

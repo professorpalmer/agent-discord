@@ -52,10 +52,21 @@ def test_host_card_is_a_v2_panel():
     assert "off" in body
     assert "listen" in body
     assert "idle" in body
+    assert "acl" in body
+    assert "open" in body
+    assert "Unpaired." in stopped.description
     assert "<t:" in body
     assert CARD_FOOTER in body
     running = host_card(armed=True)
     assert running.title == "Running"
+    assert "Writes: Auto." in running.description
+    gated = host_card(armed=True, write_gate=True)
+    assert "Writes: Gate." in gated.description
+    paired = host_card(armed=True, paired=True, operator_count=1, role_count=2)
+    assert "Paired. 1 operator. 2 roles." in paired.description
+    assert "Last:" not in paired.description
+    with_job = host_card(armed=True, paired=True, last_job="Last: failed · boom")
+    assert "Last: failed · boom" in with_job.description
     assert running.v2_components()[0]["accent_color"] == COLOR_LIVE
     assert COLOR_IDLE == stopped.v2_components()[0]["accent_color"]
     with_face = host_card(
@@ -143,19 +154,24 @@ def test_working_card_attaches_job_action_row():
     assert _button_custom_ids(idle) == []
     live = working_card(task_label="wave 2", message="editing cards", run_id="run-22")
     ids = _button_custom_ids(live)
-    assert ids == [
+    assert ids == ["discord-os:job:cancel:run-22"]
+    parked = working_card(
+        task_label="Approve write",
+        message="Waiting for Approve to write.",
+        run_id="run-22",
+        actions="parked",
+    )
+    assert _button_custom_ids(parked) == [
         "discord-os:job:approve:run-22",
         "discord-os:job:cancel:run-22",
-        "discord-os:job:retry:run-22",
     ]
     assert "run-22" not in live.text
     progress = progress_card(stage="work", message="card edited", run_id="live-card")
-    assert _button_custom_ids(progress)
-    assert all(item.startswith("discord-os:job:") for item in _button_custom_ids(progress))
+    assert _button_custom_ids(progress) == ["discord-os:job:cancel:live-card"]
 
 
 def test_job_action_custom_ids_stay_under_discord_limit():
-    row = job_action_row("r" * 200)
+    row = job_action_row("r" * 200, actions="all")
     assert row["type"] == TYPE_ACTION_ROW
     ids = [item["custom_id"] for item in row["components"]]
     assert [item[: item.rfind(":") + 1] for item in ids] == [

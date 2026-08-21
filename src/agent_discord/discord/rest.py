@@ -277,6 +277,44 @@ def edit_channel_message(
     )
 
 
+def edit_original_interaction(
+    *,
+    application_id: str,
+    interaction_token: str,
+    payload: dict[str, Any],
+    opener: Optional[UrlOpener] = None,
+) -> None:
+    """Update the message after a deferred ACK. Uses the interaction token."""
+
+    if not application_id.strip() or not interaction_token.strip():
+        raise ToolInvocationError("Discord interaction edit missing application/token")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        f"{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}/messages/@original",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="PATCH",
+    )
+    do_open = opener or urlopen
+    try:
+        with do_open(request, timeout=10) as resp:
+            resp.read()
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:240]
+        except Exception:
+            detail = ""
+        raise ToolInvocationError(
+            f"Discord interaction edit HTTP {exc.code} {detail}".strip()
+        ) from None
+    except URLError as exc:
+        raise ToolInvocationError("Discord interaction edit unreachable") from exc
+
+
 def callback_interaction(
     *,
     interaction_id: str,

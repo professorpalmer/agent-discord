@@ -10,7 +10,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from agent_discord.contracts import (
     DispatchEvent,
@@ -31,7 +31,54 @@ from agent_discord.redaction import (
 )
 
 TOKEN_TEXT_LIMIT = 1500
+RECEIPT_TEXT_LIMIT = 1800
 STREAM_PHASES = frozenset({"thinking", "plan", "code", "dispatch", "done"})
+_CLI_FLAG_CACHE: dict[tuple[str, str, str], bool] = {}
+_SUMMARY_SKIP_PREFIXES = (
+    "#",
+    "---",
+    "goal:",
+    "role:",
+    "status:",
+    "task_id=",
+    "run_id=",
+    "model=",
+    "channel_id=",
+    "job_id:",
+    "artifacts:",
+    "summary:",
+    "usage:",
+    "puppetmaster:",
+    "dispatched via",
+    "context memories:",
+    "research context:",
+    "write the answer",
+    "do not repeat",
+    "internal:",
+)
+
+
+def cli_supports_flag(cli: str, subcommand: str, flag: str) -> bool:
+    """Probe ``cli subcommand --help`` once. Live Puppetmaster may lack --json-lines."""
+
+    key = (cli, subcommand, flag)
+    cached = _CLI_FLAG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    supported = False
+    try:
+        proc = subprocess.run(
+            [cli, subcommand, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        blob = f"{proc.stdout}\n{proc.stderr}"
+        supported = flag in blob
+    except Exception:
+        supported = False
+    _CLI_FLAG_CACHE[key] = supported
+    return supported
 _TOKEN_EVENT_TYPES = frozenset({"token", "delta", "reasoning"})
 _PHASE_ALIASES = {
     "think": "thinking",
@@ -242,20 +289,23 @@ class PuppetmasterCliBackend:
             return
 
         prompt = _safe_dispatch_prompt(request)
-        command = [
-            self.cli,
-            "cursor",
-            "--implement",
-            "--allow-dirty",
-            "--model",
-            pin.adapter_name,
-            "--timeout-seconds",
-            str(int(self.timeout_seconds)),
-        ]
+        command = prepend_early_job_id(
+            [
+                self.cli,
+                "cursor",
+                "--implement",
+                "--allow-dirty",
+                "--model",
+                pin.adapter_name,
+                "--timeout-seconds",
+                str(int(self.timeout_seconds)),
+            ]
+        )
         workdir = str(self.cwd) if self.cwd else None
         if workdir:
             command.extend(["--cwd", workdir])
-        command.append("--json-lines")
+        if cli_supports_flag(self.cli, "cursor", "--json-lines"):
+            command.append("--json-lines")
         command.append(prompt)
 
         try:
@@ -274,26 +324,6 @@ class PuppetmasterCliBackend:
             )
             return
 
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-        stdout_queue: queue.Queue[Optional[str]] = queue.Queue()
-        stderr_queue: queue.Queue[Optional[str]] = queue.Queue()
-
-        def _reader(pipe: Any, out: queue.Queue[Optional[str]], sink: list[str]) -> None:
-            try:
-                for line in iter(pipe.readline, ""):
-                    sink.append(line)
-                    out.put(line)
-            finally:
-                out.put(None)
-
-        threads = [
-            threading.Thread(target=_reader, args=(proc.stdout, stdout_queue, stdout_lines), daemon=True),
-            threading.Thread(target=_reader, args=(proc.stderr, stderr_queue, stderr_lines), daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
         yield DispatchEvent(
             kind=EventKind.DISPATCH,
             summary=ProgressSummary(
@@ -303,62 +333,19 @@ class PuppetmasterCliBackend:
                 details={"model": pin.canonical},
             ),
         )
-
-        done_stdout = False
-        done_stderr = False
-        token_buffer = TokenStreamBuffer()
-        try:
-            while not (done_stdout and done_stderr):
-                if not done_stdout:
-                    try:
-                        line = stdout_queue.get(timeout=0.25)
-                        if line is None:
-                            done_stdout = True
-                        else:
-                            event = _event_from_cli_line(line, pin.canonical, token_buffer)
-                            if event is not None:
-                                yield event
-                    except queue.Empty:
-                        pass
-                if not done_stderr:
-                    try:
-                        line = stderr_queue.get(timeout=0.25)
-                        if line is None:
-                            done_stderr = True
-                    except queue.Empty:
-                        pass
-                if proc.poll() is not None and done_stdout and done_stderr:
-                    break
-            proc.wait(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            self._statuses[request.run_id] = TaskStatus.FAILED
-            yield DispatchEvent(
-                kind=EventKind.ERROR,
-                summary=ProgressSummary(stage="dispatch", message="timeout"),
-            )
-            return
-
-        stdout = "".join(stdout_lines)
-        stderr = "".join(stderr_lines)
-        safe_meta = _parse_safe_cli_completion(stdout, stderr)
-        if proc.returncode != 0:
-            self._statuses[request.run_id] = TaskStatus.FAILED
-            err = safe_meta.get("error") or stderr.strip() or f"exit {proc.returncode}"
-            yield DispatchEvent(
-                kind=EventKind.ERROR,
-                summary=ProgressSummary(stage="dispatch", message=str(err)),
-            )
-            return
-
-        summary = str(safe_meta.get("summary") or "completed")
-        self._statuses[request.run_id] = TaskStatus.COMPLETED
-        yield DispatchEvent(
-            kind=EventKind.RECEIPT,
-            summary=ProgressSummary(stage="done", message=summary, percent=100.0),
-            payload=safe_meta,
-        )
+        for event in iter_cli_process_events(
+            proc,
+            model=pin.canonical,
+            cli=self.cli,
+            timeout_seconds=self.timeout_seconds,
+        ):
+            if event.kind == EventKind.ERROR:
+                self._statuses[request.run_id] = TaskStatus.FAILED
+            elif event.kind == EventKind.RECEIPT:
+                self._statuses[request.run_id] = TaskStatus.COMPLETED
+            yield event
+        if self._statuses.get(request.run_id) == TaskStatus.RUNNING:
+            self._statuses[request.run_id] = TaskStatus.COMPLETED
 
 
 def _safe_dispatch_prompt(request: DispatchRequest) -> str:
@@ -372,6 +359,10 @@ def _safe_dispatch_prompt(request: DispatchRequest) -> str:
     lines = [
         request.prompt.strip(),
         "",
+        "Write the answer as visible prose a person can read in Discord.",
+        "Do not repeat task_id, run_id, or model lines.",
+        "",
+        "Internal:",
         f"task_id={request.task_id}",
         f"run_id={request.run_id}",
         f"model={request.model}",
@@ -416,20 +407,84 @@ _SAFE_SUMMARY_KEYS = frozenset(
 )
 
 
-_SUMMARY_SKIP_PREFIXES = ("#", "---", "goal:", "role:", "status:")
+def prepend_early_job_id(command: list[str]) -> list[str]:
+    if len(command) < 2 or command[1] == "--emit-job-id-early":
+        return list(command)
+    return [command[0], "--emit-job-id-early", *command[1:]]
 
 
-def _first_visible_summary_line(text: str) -> str:
+def usable_worker_text(text: str, *, limit: int = RECEIPT_TEXT_LIMIT) -> str:
+    """Keep human dialogue. Drop prompt echoes and CLI metadata."""
+
+    parts: list[str] = []
     for line in (text or "").splitlines():
         raw = line.strip()
         if not raw:
+            if parts and parts[-1] != "":
+                parts.append("")
             continue
-        lower = raw.lower()
-        if any(lower.startswith(prefix) for prefix in _SUMMARY_SKIP_PREFIXES):
+        if _is_skipped_worker_line(raw):
             continue
-        return raw[:500]
-    first = (text or "").strip().splitlines()
-    return first[0][:500] if first else "completed"
+        parts.append(raw)
+    body = "\n".join(parts).strip()
+    if len(body) > limit:
+        return body[: max(0, limit - 3)].rstrip() + "..."
+    return body
+
+
+def _is_skipped_worker_line(raw: str) -> bool:
+    lower = (raw or "").strip().lower()
+    return any(lower.startswith(prefix) for prefix in _SUMMARY_SKIP_PREFIXES)
+
+
+def _first_visible_summary_line(text: str) -> str:
+    return usable_worker_text(text, limit=500) or "completed"
+
+
+def job_show_text(cli: str, job_id: str) -> str:
+    ident = (job_id or "").strip()
+    if not cli or not ident:
+        return ""
+    try:
+        proc = subprocess.run(
+            [cli, "show", ident],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return ""
+    return usable_worker_text(proc.stdout or "")
+
+
+def _is_placeholder_summary(text: str) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw or raw in {"completed", "ok", "done"}:
+        return True
+    if raw.startswith("puppetmaster job ") and raw.endswith(" completed"):
+        return True
+    if raw.startswith("worker finished without"):
+        return True
+    return False
+
+
+def _completion_summary(
+    safe_meta: Mapping[str, Any],
+    buffer: "TokenStreamBuffer",
+    cli: str,
+) -> str:
+    spoken_meta = usable_worker_text(str(safe_meta.get("summary") or ""))
+    if spoken_meta and not _is_placeholder_summary(spoken_meta):
+        return spoken_meta
+    spoken_buf = usable_worker_text(buffer.text)
+    if spoken_buf:
+        return spoken_buf
+    shown = job_show_text(cli, str(safe_meta.get("job_id") or ""))
+    if shown:
+        return shown
+    if spoken_meta:
+        return spoken_meta
+    return "Worker finished without a written answer."
 
 
 def _parse_safe_cli_completion(stdout: str, stderr: str) -> dict[str, Any]:
@@ -458,8 +513,10 @@ def _parse_safe_cli_completion(stdout: str, stderr: str) -> dict[str, Any]:
             if "summary" not in meta:
                 for key in ("summary", "result", "message"):
                     if cleaned.get(key):
-                        meta["summary"] = str(cleaned[key])
-                        break
+                        spoken = usable_worker_text(str(cleaned[key]))
+                        if spoken:
+                            meta["summary"] = spoken
+                            break
 
     summary_path = meta.get("summary_path")
     if summary_path and "summary" not in meta:
@@ -481,7 +538,17 @@ def _parse_safe_cli_completion(stdout: str, stderr: str) -> dict[str, Any]:
                             if key == "summary":
                                 break
             elif text.strip():
-                meta["summary"] = _first_visible_summary_line(text)
+                spoken = usable_worker_text(text)
+                if spoken:
+                    meta["summary"] = spoken
+
+    raw_summary = meta.get("summary")
+    if raw_summary:
+        spoken = usable_worker_text(str(raw_summary))
+        if spoken:
+            meta["summary"] = spoken
+        else:
+            meta.pop("summary", None)
 
     if "summary" not in meta:
         if meta.get("job_id"):
@@ -545,6 +612,20 @@ def _normalize_stream_phase(raw: str, default: str = "thinking") -> str:
     return default if default in STREAM_PHASES else "thinking"
 
 
+def _normalize_token_event_type(parsed: Mapping[str, Any]) -> str:
+    event_type = str(parsed.get("type") or "").strip().lower()
+    if event_type == "text":
+        return "delta"
+    if event_type in _TOKEN_EVENT_TYPES:
+        return event_type
+    kind = str(parsed.get("kind") or "").strip().lower()
+    if kind in {"text", "token", "delta"}:
+        return "delta"
+    if not event_type and parsed.get("text"):
+        return "delta"
+    return event_type
+
+
 def _extract_token_text(cleaned: dict[str, Any], event_type: str) -> str:
     if event_type == "delta":
         keys = ("text", "content", "delta")
@@ -584,13 +665,13 @@ def _parse_token_line(
     parsed = _try_parse_json(raw)
     if not isinstance(parsed, dict):
         return None
-    event_type = str(parsed.get("type") or "").strip().lower()
+    event_type = _normalize_token_event_type(parsed)
     if event_type not in _TOKEN_EVENT_TYPES:
         return None
     cleaned = strip_forbidden_keys(parsed)
     if not isinstance(cleaned, dict):
         return None
-    event_type = str(cleaned.get("type") or event_type).strip().lower()
+    event_type = _normalize_token_event_type(cleaned) or event_type
     if event_type not in _TOKEN_EVENT_TYPES:
         return None
 
@@ -615,6 +696,8 @@ def _parse_token_line(
             percent = float(cleaned["percent"])
         except (TypeError, ValueError):
             percent = None
+    if percent is None:
+        percent = min(92.0, 10.0 + (len(state.text) * 0.04))
 
     details: dict[str, Any] = {
         "token": event_type in {"token", "delta"},
@@ -644,7 +727,7 @@ def _event_from_cli_line(
     model: str,
     buffer: TokenStreamBuffer,
 ) -> Optional[DispatchEvent]:
-    """Prefer token/reasoning NDJSON; fall back to existing progress lines."""
+    """Prefer token/reasoning NDJSON; then progress; then visible prose."""
     token_event = _parse_token_line(line, model, buffer=buffer)
     if token_event is not None:
         return token_event
@@ -656,7 +739,162 @@ def _event_from_cli_line(
         )
         if stage in STREAM_PHASES:
             buffer.set_phase(stage)
-    return progress
+        return progress
+    return _prose_token_event(line, model, buffer)
+
+
+def _prose_token_event(
+    line: str,
+    model: str,
+    buffer: TokenStreamBuffer,
+) -> Optional[DispatchEvent]:
+    raw = (line or "").strip()
+    if not raw or _is_skipped_worker_line(raw):
+        return None
+    if raw[:1] in "{[":
+        return None
+    chunk = redact_text_markers(raw)
+    if not chunk.strip():
+        return None
+    buffer.extend(chunk + "\n")
+    return DispatchEvent(
+        kind=EventKind.PROGRESS,
+        summary=ProgressSummary(
+            stage=buffer.phase,
+            message=chunk[:500],
+            percent=min(92.0, 10.0 + (len(buffer.text) * 0.04)),
+            details={
+                "token": True,
+                "stream_phase": buffer.phase,
+                "token_text": buffer.text,
+                "model": model,
+            },
+        ),
+    )
+
+
+def _start_delta_follower(cli: str, job_id: str, timeout_seconds: float) -> Optional[Any]:
+    ident = (job_id or "").strip()
+    if not cli or not ident:
+        return None
+    try:
+        return subprocess.Popen(
+            [
+                cli,
+                "deltas",
+                ident,
+                "--follow",
+                "--json",
+                "--follow-timeout-seconds",
+                str(max(8, int(timeout_seconds))),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+
+
+def iter_cli_process_events(
+    proc: Any,
+    *,
+    model: str,
+    cli: str = "",
+    timeout_seconds: float = 3600.0,
+) -> Iterator[DispatchEvent]:
+    """Read CLI stdout/stderr plus optional `deltas --follow` into live events."""
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    line_queue: queue.Queue[Any] = queue.Queue()
+    main_done = 0
+
+    def _main_reader(pipe: Any, sink: list[str]) -> None:
+        try:
+            if pipe is None:
+                return
+            for line in iter(pipe.readline, ""):
+                sink.append(line)
+                line_queue.put(line)
+        finally:
+            line_queue.put("__main_done__")
+
+    def _follow_reader(pipe: Any) -> None:
+        if pipe is None:
+            return
+        for line in iter(pipe.readline, ""):
+            line_queue.put(line)
+
+    for pipe, sink in ((proc.stdout, stdout_lines), (proc.stderr, stderr_lines)):
+        threading.Thread(target=_main_reader, args=(pipe, sink), daemon=True).start()
+
+    token_buffer = TokenStreamBuffer()
+    follower = None
+    seen_job_id = ""
+    try:
+        while True:
+            try:
+                item = line_queue.get(timeout=0.25)
+            except queue.Empty:
+                if proc.poll() is not None and main_done >= 2:
+                    break
+                continue
+            if item == "__main_done__":
+                main_done += 1
+                if proc.poll() is not None and main_done >= 2:
+                    break
+                continue
+            line = str(item)
+            stripped = line.strip()
+            if stripped.lower().startswith("job_id:") and not seen_job_id:
+                seen_job_id = stripped.split(":", 1)[1].strip()
+                if follower is None:
+                    follower = _start_delta_follower(cli, seen_job_id, timeout_seconds)
+                    if follower is not None:
+                        threading.Thread(
+                            target=_follow_reader,
+                            args=(follower.stdout,),
+                            daemon=True,
+                        ).start()
+            event = _event_from_cli_line(line, model, token_buffer)
+            if event is not None:
+                yield event
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        yield DispatchEvent(
+            kind=EventKind.ERROR,
+            summary=ProgressSummary(stage="dispatch", message="timeout"),
+        )
+        return
+    finally:
+        if follower is not None:
+            try:
+                follower.kill()
+                follower.wait(timeout=2)
+            except Exception:
+                pass
+
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
+    safe_meta = _parse_safe_cli_completion(stdout, stderr)
+    if proc.returncode not in {0, None}:
+        err = safe_meta.get("error") or stderr.strip() or f"exit {proc.returncode}"
+        yield DispatchEvent(
+            kind=EventKind.ERROR,
+            summary=ProgressSummary(stage="dispatch", message=str(err)),
+        )
+        return
+    summary = _completion_summary(safe_meta, token_buffer, cli)
+    if isinstance(safe_meta, dict):
+        safe_meta["summary"] = summary
+    yield DispatchEvent(
+        kind=EventKind.RECEIPT,
+        summary=ProgressSummary(stage="done", message=summary, percent=100.0),
+        payload=safe_meta,
+    )
 
 
 def _parse_progress_line(line: str, model: str) -> Optional[DispatchEvent]:

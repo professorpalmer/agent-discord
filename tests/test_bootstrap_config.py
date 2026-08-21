@@ -10,6 +10,7 @@ from agent_discord.config import (
     ConfigError,
     check_config,
     load_config,
+    resolve_puppetmaster_cli,
 )
 from agent_discord.puppetmaster.models import CANONICAL_MODEL
 
@@ -152,3 +153,15 @@ def test_load_config_rejects_unknown_interactions(tmp_path: Path):
         raised = True
         assert "off" in str(exc)
     assert raised
+
+
+def test_resolve_puppetmaster_cli_prefers_venv_sibling(tmp_path: Path, monkeypatch):
+    sibling = tmp_path / "python-bin" / "puppetmaster"
+    sibling.parent.mkdir()
+    sibling.write_text("#!/bin/sh\n", encoding="utf-8")
+    sibling.chmod(0o755)
+    monkeypatch.setattr(
+        "agent_discord.config.sys.executable",
+        str(tmp_path / "python-bin" / "python"),
+    )
+    assert resolve_puppetmaster_cli("puppetmaster") == str(sibling)

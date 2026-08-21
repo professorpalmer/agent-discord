@@ -112,12 +112,18 @@ class CardMessage:
             children = [text_display(heading)]
         if self.kind == "HOST":
             live = self.title == "Running"
+            acl = "paired"
+            for name, value, _inline in self.fields:
+                if name == "acl":
+                    acl = value
+                    break
             children.append(
                 text_display(
                     status_table(
                         (
                             ("power", "on" if live else "off"),
                             ("listen", "live" if live else "idle"),
+                            ("acl", acl),
                         )
                     )
                 )
@@ -127,7 +133,7 @@ class CardMessage:
             body_parts.append(self.description)
         if self.percent is not None:
             body_parts.append(f"`{progress_bar(self.percent)}`")
-        if self.fields:
+        if self.fields and self.kind != "HOST":
             body_parts.append(
                 "\n".join(f"`{name}`  {value}" for name, value, _inline in self.fields)
             )
@@ -254,6 +260,7 @@ def progress_card(
     message: str,
     percent: Optional[float] = None,
     run_id: str = "",
+    actions: str = "running",
 ) -> CardMessage:
     title = _title_case(stage) or "Working"
     body = redact_text_markers(message or "")
@@ -263,7 +270,7 @@ def progress_card(
         description=body,
         color=COLOR_WORK,
         percent=percent,
-        rows=_job_rows(run_id),
+        rows=_job_rows(run_id, actions),
     )
 
 
@@ -273,6 +280,7 @@ def working_card(
     message: str = "",
     percent: Optional[float] = None,
     run_id: str = "",
+    actions: str = "running",
 ) -> CardMessage:
     title = _title_case(task_label) or "Working"
     return CardMessage(
@@ -281,7 +289,7 @@ def working_card(
         description=redact_text_markers(message or ""),
         color=COLOR_WORK,
         percent=percent,
-        rows=_job_rows(run_id),
+        rows=_job_rows(run_id, actions),
     )
 
 
@@ -310,15 +318,25 @@ def diff_card(
     )
 
 
-def job_action_row(run_id: str) -> dict[str, Any]:
+def job_action_row(run_id: str, *, actions: str = "parked") -> dict[str, Any]:
     rid = (run_id or "").strip()
-    return action_row(
-        [
+    mode = (actions or "parked").strip().lower()
+    if mode == "running":
+        items = [button("Cancel", job_custom_id("cancel", rid), style=STYLE_DANGER)]
+    elif mode == "done":
+        items = [button("Retry", job_custom_id("retry", rid), style=STYLE_PRIMARY)]
+    elif mode == "all":
+        items = [
             button("Approve", job_custom_id("approve", rid), style=STYLE_SUCCESS),
             button("Cancel", job_custom_id("cancel", rid), style=STYLE_DANGER),
             button("Retry", job_custom_id("retry", rid), style=STYLE_PRIMARY),
         ]
-    )
+    else:
+        items = [
+            button("Approve", job_custom_id("approve", rid), style=STYLE_SUCCESS),
+            button("Cancel", job_custom_id("cancel", rid), style=STYLE_DANGER),
+        ]
+    return action_row(items)
 
 
 def render_receipt_card(receipt: RunReceipt, *, max_progress: int = 5) -> str:
@@ -362,6 +380,7 @@ def receipt_card(receipt: RunReceipt, *, max_progress: int = 5) -> CardMessage:
         color=color,
         fields=tuple(fields),
         link_url=jump,
+        rows=_job_rows(receipt.run_id, "done"),
     )
 
 
@@ -409,9 +428,18 @@ def host_card(
     spend_usd: float = 0.0,
     cap_usd: Optional[float] = None,
     halted: bool = False,
+    paired: bool = False,
+    operator_count: int = 0,
+    role_count: int = 0,
+    last_job: str = "",
+    write_gate: bool = False,
 ) -> CardMessage:
     _ = channel_id
     spend_line = _host_spend_line(spend_usd, cap_usd, halted)
+    acl_line = _host_acl_line(paired, operator_count, role_count)
+    fields: tuple[tuple[str, str, bool], ...] = (
+        ("acl", "paired" if paired else "open", True),
+    )
     if confirm_off:
         return CardMessage(
             kind="HOST",
@@ -419,28 +447,56 @@ def host_card(
             description="Press Confirm to stop, or Cancel to keep running.",
             color=COLOR_WORK,
             avatar_url=avatar_url,
+            fields=fields,
         )
     if armed:
-        body = "Press Ask, or type a task here. Off needs a confirm."
+        body = (
+            f"{acl_line}\n{_host_write_line(write_gate)}\n"
+            "Press Ask, Files, Terminal, or Browser. Off needs a confirm."
+        )
         if spend_line:
             body = f"{body}\n{spend_line}"
+        if last_job:
+            body = f"{body}\n{last_job}"
         return CardMessage(
             kind="HOST",
             title="Halted" if halted else "Running",
             description=body,
             color=COLOR_FAIL if halted else COLOR_LIVE,
             avatar_url=avatar_url,
+            fields=fields,
         )
-    stopped = "Press On to start."
+    stopped = f"{acl_line}\n{_host_write_line(write_gate)}\nPress On to start."
     if spend_line:
         stopped = f"{stopped}\n{spend_line}"
+    if last_job:
+        stopped = f"{stopped}\n{last_job}"
     return CardMessage(
         kind="HOST",
         title="Stopped",
         description=stopped,
         color=COLOR_IDLE,
         avatar_url=avatar_url,
+        fields=fields,
     )
+
+
+def _host_acl_line(paired: bool, operator_count: int, role_count: int) -> str:
+    if not paired:
+        return "Unpaired. Press Pair."
+    ops = f"{max(0, int(operator_count))} operator"
+    if operator_count != 1:
+        ops += "s"
+    roles = f"{max(0, int(role_count))} role"
+    if role_count != 1:
+        roles += "s"
+    return f"Paired. {ops}. {roles}."
+
+
+def _host_write_line(write_gate: bool) -> str:
+    if write_gate:
+        return "Writes: Gate. Press Auto to skip Approve."
+    return "Writes: Auto. Press Gate to require Approve."
 
 
 def _host_spend_line(
@@ -603,10 +659,10 @@ def _title_case(stage: str) -> str:
     return raw[:1].upper() + raw[1:] if raw else ""
 
 
-def _job_rows(run_id: str) -> tuple[dict[str, Any], ...]:
+def _job_rows(run_id: str, actions: str = "running") -> tuple[dict[str, Any], ...]:
     if not (run_id or "").strip():
         return ()
-    return (job_action_row(run_id),)
+    return (job_action_row(run_id, actions=actions),)
 
 
 def _fence_language(language: str) -> str:

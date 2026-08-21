@@ -11,10 +11,12 @@ from agent_discord.puppetmaster.agentic import AgenticPuppetmasterBackend
 from agent_discord.puppetmaster.backend import (
     PuppetmasterCliBackend,
     TokenStreamBuffer,
+    _event_from_cli_line,
     _parse_progress_line,
     _parse_safe_cli_completion,
     _parse_token_line,
     _safe_dispatch_prompt,
+    usable_worker_text,
 )
 from agent_discord.puppetmaster.models import AGENTIC_MODEL_PIN, DEFAULT_MODEL_PIN
 
@@ -105,6 +107,36 @@ def test_parse_skips_stitched_summary_heading(tmp_path: Path):
     )
     meta = _parse_safe_cli_completion(f"job_id: j2\nsummary: {summary}\n", "")
     assert meta["summary"] == "Discord OS is the harness UI."
+
+
+def test_parse_skips_task_id_echo_and_keeps_answer(tmp_path: Path):
+    summary = tmp_path / "summary.md"
+    summary.write_text(
+        "# Puppetmaster Stitched Summary\n\n"
+        "Goal: check my puppetmaster repo\n\n"
+        "task_id=5ff50a3793004ee38b9628602d7969da\n"
+        "run_id=ef9c5401cf034c428aaf02e720261ece\n\n"
+        "Open PRs: none. Open issues: #12 docs drift.\n",
+        encoding="utf-8",
+    )
+    meta = _parse_safe_cli_completion(f"job_id: j3\nsummary: {summary}\n", "")
+    assert "task_id=" not in meta["summary"]
+    assert "Open PRs: none." in meta["summary"]
+    assert usable_worker_text("task_id=abc") == ""
+
+
+def test_prose_cli_line_becomes_token_stream():
+    buffer = TokenStreamBuffer()
+    event = _event_from_cli_line(
+        "Open PRs: none. Two issues need labels.",
+        "openrouter/auto",
+        buffer,
+    )
+    assert event is not None
+    assert event.kind == EventKind.PROGRESS
+    assert event.summary.details["token"] is True
+    assert "Open PRs: none." in str(event.summary.details["token_text"])
+    assert _event_from_cli_line("task_id=abc", "openrouter/auto", buffer) is None
 
 
 def test_dispatch_uses_cursor_subcommand(monkeypatch, tmp_path: Path):
@@ -240,13 +272,18 @@ def test_parse_progress_line_still_reads_percent_and_stage():
 class _FakePopen:
     def __init__(self, cmd, **kwargs):
         self.args = list(cmd)
-        self.stdout = io.StringIO(
-            '{"type":"reasoning","summary":"think first"}\n'
-            '{"type":"token","content":"Hi"}\n'
-            '{"type":"delta","text":" there"}\n'
-            '{"percent": 40, "stage": "code", "message": "writing"}\n'
-            "job_id: j-stream\nsummary: streamed ok\n"
-        )
+        if "deltas" in cmd:
+            self.stdout = io.StringIO(
+                '{"ts": 1, "kind": "text", "text": "Open PRs: none."}\n'
+            )
+        else:
+            self.stdout = io.StringIO(
+                '{"type":"reasoning","summary":"think first"}\n'
+                '{"type":"token","content":"Hi"}\n'
+                '{"type":"delta","text":" there"}\n'
+                '{"percent": 40, "stage": "code", "message": "writing"}\n'
+                "job_id: j-stream\nsummary: streamed ok\n"
+            )
         self.stderr = io.StringIO("")
         self.returncode = 0
 
@@ -265,7 +302,7 @@ def test_cli_stream_yields_token_progress_from_popen(monkeypatch, tmp_path: Path
 
     def fake_popen(cmd, **kwargs):
         proc = _FakePopen(cmd, **kwargs)
-        captured["cmd"] = proc.args
+        captured.setdefault("cmds", []).append(list(proc.args))
         return proc
 
     monkeypatch.setattr(
@@ -276,13 +313,20 @@ def test_cli_stream_yields_token_progress_from_popen(monkeypatch, tmp_path: Path
         "agent_discord.puppetmaster.backend.subprocess.Popen",
         fake_popen,
     )
+    monkeypatch.setattr(
+        "agent_discord.puppetmaster.backend.cli_supports_flag",
+        lambda *args, **kwargs: False,
+    )
     backend = PuppetmasterCliBackend(
         cli="puppetmaster",
         pin=DEFAULT_MODEL_PIN,
         cwd=tmp_path,
     )
     events = list(backend.stream(_request()))
-    assert "--json-lines" in captured["cmd"]
+    worker = next(cmd for cmd in captured["cmds"] if "cursor" in cmd)
+    assert "--json-lines" not in worker
+    assert "--emit-job-id-early" in worker
+    assert any("deltas" in cmd for cmd in captured["cmds"])
     token_events = [event for event in events if event.summary.details.get("token")]
     assert token_events
     assert all(event.kind == EventKind.PROGRESS for event in token_events)
@@ -299,7 +343,7 @@ def test_agentic_stream_passes_json_lines_and_parses_tokens(monkeypatch, tmp_pat
 
     def fake_popen(cmd, **kwargs):
         proc = _FakePopen(cmd, **kwargs)
-        captured["cmd"] = proc.args
+        captured.setdefault("cmds", []).append(list(proc.args))
         return proc
 
     monkeypatch.setattr(
@@ -308,6 +352,14 @@ def test_agentic_stream_passes_json_lines_and_parses_tokens(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(
         "agent_discord.puppetmaster.agentic.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "agent_discord.puppetmaster.agentic.cli_supports_flag",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "agent_discord.puppetmaster.backend.subprocess.Popen",
         fake_popen,
     )
     backend = AgenticPuppetmasterBackend(
@@ -324,5 +376,8 @@ def test_agentic_stream_passes_json_lines_and_parses_tokens(monkeypatch, tmp_pat
         context=ContextSnapshot(task_id="t1", memories=[], bindings={}),
     )
     events = list(backend.stream(request))
-    assert "--json-lines" in captured["cmd"]
+    worker = next(cmd for cmd in captured["cmds"] if "agentic" in cmd)
+    assert "--json-lines" not in worker
+    assert "--emit-job-id-early" in worker
+    assert "--worker-mode" in worker
     assert any(event.summary.details.get("token") for event in events)

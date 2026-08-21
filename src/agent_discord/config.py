@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional
@@ -196,6 +198,19 @@ def load_config(
         or "127.0.0.1",
         interactions_port=interactions_port,
     )
+
+
+def resolve_puppetmaster_cli(configured: str = "puppetmaster") -> str:
+    """Prefer the CLI next to this Python. LaunchAgents often have a tiny PATH."""
+
+    name = (configured or "puppetmaster").strip() or "puppetmaster"
+    sibling = Path(sys.executable).resolve().parent / Path(name).name
+    if sibling.is_file():
+        return str(sibling)
+    found = shutil.which(name)
+    if found:
+        return found
+    return name
 
 
 def read_host_bot_token(*, path: Optional[Path] = None) -> str:

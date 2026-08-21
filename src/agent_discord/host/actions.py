@@ -10,8 +10,8 @@ toggle host power or dispatch Puppetmaster.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
-import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -83,10 +83,27 @@ def run_host_action(
     if kind not in SURFACES:
         raise HostActionError(f"unknown surface {surface!r}")
     if kind == "browser":
-        url = allow_browser_url(target)
-        opener = browser_open or webbrowser.open
-        opener(url)
-        return HostActionResult(surface="browser", target=url, opened=True)
+        url = (target or "").strip()
+        if url:
+            url = allow_browser_url(url)
+        argv = host_browser_argv(url)
+        label = url or host_browser_label(argv)
+        if browser_open is not None:
+            browser_open(label)
+            return HostActionResult(
+                surface="browser",
+                target=label,
+                argv=tuple(argv),
+                opened=True,
+            )
+        do_run = runner or _default_runner
+        do_run(argv, cwd=None)
+        return HostActionResult(
+            surface="browser",
+            target=label,
+            argv=tuple(argv),
+            opened=True,
+        )
     path = confine_host_path(target, roots)
     argv, cwd = _open_argv(kind, path)
     do_run = runner or _default_runner
@@ -118,6 +135,127 @@ def confine_host_path(raw: str, roots: Sequence[Path]) -> Path:
         except ValueError:
             continue
     raise HostActionError("path is outside host roots")
+
+
+def host_browser_argv(url: str = "") -> list[str]:
+    """Launch Chromium-family if present; otherwise the system default browser."""
+
+    href = (url or "").strip()
+    env_argv = _env_browser_argv(href)
+    if env_argv:
+        return env_argv
+    found = _discover_chromium()
+    if found is not None:
+        return _launch_browser_argv(found, href)
+    return _system_browser_argv(href)
+
+
+def host_browser_label(argv: Optional[Sequence[str]] = None) -> str:
+    command = list(argv) if argv is not None else host_browser_argv("")
+    if len(command) >= 3 and command[0] == "open" and command[1] == "-a":
+        return Path(command[2]).stem or "Browser"
+    if command:
+        name = Path(command[0]).stem.replace("-", " ").strip()
+        if name and name.lower() not in {"open", "xdg-open", "cmd", "start"}:
+            return name
+    return "System browser"
+
+
+def _env_browser_argv(url: str) -> Optional[list[str]]:
+    raw = (
+        os.environ.get("DISCORD_OS_BROWSER")
+        or os.environ.get("AGENT_DISCORD_BROWSER")
+        or ""
+    ).strip()
+    if not raw:
+        return None
+    looks_like_path = raw.startswith("/") or (len(raw) > 2 and raw[1] == ":" and raw[2] in {"\\", "/"})
+    if looks_like_path:
+        argv = [raw]
+        if url:
+            argv.append(url)
+        return argv
+    if sys.platform == "darwin":
+        argv = ["open", "-a", raw]
+        if url:
+            argv.append(url)
+        return argv
+    which = shutil.which(raw)
+    if which:
+        argv = [which]
+        if url:
+            argv.append(url)
+        return argv
+    return None
+
+
+def _discover_chromium() -> Optional[Path]:
+    playwright = _playwright_chromium()
+    if playwright is not None:
+        return playwright
+    if sys.platform == "darwin":
+        for name in (
+            "Google Chrome",
+            "Chromium",
+            "Google Chrome for Testing",
+            "Brave Browser",
+            "Microsoft Edge",
+        ):
+            for parent in (Path("/Applications"), Path.home() / "Applications"):
+                app = parent / f"{name}.app"
+                if app.is_dir():
+                    return app
+    for binary in ("google-chrome", "chromium", "chromium-browser", "chrome", "brave-browser"):
+        found = shutil.which(binary)
+        if found:
+            return Path(found)
+    return None
+
+
+def _playwright_chromium() -> Optional[Path]:
+    roots = (
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+        Path.home() / ".cache" / "ms-playwright",
+        Path.home() / "AppData" / "Local" / "ms-playwright",
+    )
+    patterns = (
+        "chromium-*/chrome-mac*/Chromium.app",
+        "chromium-*/chrome-mac*/Google Chrome for Testing.app",
+        "chrome-*/chrome-mac*/Google Chrome for Testing.app",
+        "chromium-*/chrome-linux/chrome",
+        "chromium-*/chrome-win64/chrome.exe",
+        "chromium-*/chrome-win/chrome.exe",
+    )
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in patterns:
+            matches = sorted(root.glob(pattern))
+            if matches:
+                return matches[-1]
+    return None
+
+
+def _launch_browser_argv(app_or_bin: Path, url: str) -> list[str]:
+    if sys.platform == "darwin" and app_or_bin.suffix == ".app":
+        argv = ["open", "-a", str(app_or_bin)]
+        if url:
+            argv.append(url)
+        return argv
+    argv = [str(app_or_bin)]
+    if url:
+        argv.append(url)
+    return argv
+
+
+def _system_browser_argv(url: str) -> list[str]:
+    if sys.platform == "darwin":
+        if url:
+            return ["open", url]
+        return ["open", "-a", "Safari"]
+    if sys.platform == "win32":
+        return ["cmd", "/c", "start", "", url or "about:blank"]
+    return ["xdg-open", url or "about:blank"]
 
 
 def allow_browser_url(raw: str) -> str:
